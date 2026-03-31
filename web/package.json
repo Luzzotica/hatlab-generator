@@ -1,0 +1,36 @@
+{
+  "name": "web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --turbopack",
+    "build": "next build --turbopack",
+    "start": "next start",
+    "lint": "eslint",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@react-three/drei": "^10.7.7",
+    "@react-three/fiber": "^9.5.0",
+    "@types/three": "^0.183.1",
+    "next": "15.5.14",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "three": "^0.183.2",
+    "three-bvh-csg": "^0.0.18",
+    "three-mesh-bvh": "^0.9.9"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^6.0.1",
+    "eslint": "^9",
+    "eslint-config-next": "15.5.14",
+    "jsdom": "^29.0.1",
+    "typescript": "^5",
+    "vitest": "^4.1.2"
+  }
+}

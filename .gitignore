@@ -1,0 +1,14 @@
+# Web
+web/node_modules/
+web/.next/
+web/out/
+
+# Env / OS
+.DS_Store
+.env*.local
+
+# Legacy Python (if recreated locally)
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
