@@ -1,10 +1,11 @@
-import type { HatSkeletonSpec, PanelCount, VisorSpec } from "./types";
+import type { HatSkeletonSpec, PanelCount, SeamEndpointStyle, VisorSpec } from "./types";
 
 /** 3D point [x, y, z]; +Z up, +Y forward. */
 export type Vec3 = readonly [number, number, number];
 
 export type SeamCurve =
   | { kind: "bezier"; ctrl: [Vec3, Vec3, Vec3] }
+  | { kind: "cubic"; ctrl: [Vec3, Vec3, Vec3, Vec3] }
   | {
       kind: "superellipse";
       rim: Vec3;
@@ -26,7 +27,14 @@ export type SeamCurve =
       /** 0 = base Bézier curve, 1 = piecewise-linear V */
       blend: number;
       baseCurve: [Vec3, Vec3, Vec3];
+      /** Chord-length split (linear V); used when leg strengths are 0. */
       tSplit: number;
+      legBottomStrength: number;
+      legTopStrength: number;
+      /** Cached quadratics for bulged legs; arc-length param split. */
+      lowerQuad: [Vec3, Vec3, Vec3];
+      upperQuad: [Vec3, Vec3, Vec3];
+      arcLenTSplit: number;
     };
 
 const Z_UP: Vec3 = [0, 0, 1];
@@ -342,7 +350,453 @@ export function evalQuadraticBezier(p0: Vec3, p1: Vec3, p2: Vec3, t: number): [n
   ];
 }
 
-const ARC_LEN_SEGMENTS = 48;
+export function evalCubicBezier(
+  p0: Vec3,
+  p1: Vec3,
+  p2: Vec3,
+  p3: Vec3,
+  t: number
+): [number, number, number] {
+  const u = 1 - t;
+  const u2 = u * u;
+  const u3 = u2 * u;
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return [
+    u3 * p0[0] + 3 * u2 * t * p1[0] + 3 * u * t2 * p2[0] + t3 * p3[0],
+    u3 * p0[1] + 3 * u2 * t * p1[1] + 3 * u * t2 * p2[1] + t3 * p3[1],
+    u3 * p0[2] + 3 * u2 * t * p1[2] + 3 * u * t2 * p2[2] + t3 * p3[2],
+  ];
+}
+
+/** Seam plane: +u from rim→top chord, +v outward bulge (matches `seamQuadraticBezier`). */
+export function seamPlaneFrameFromRimTop(
+  rim: Vec3,
+  top: Vec3
+): { u: [number, number, number]; v: [number, number, number]; planeN: [number, number, number] } {
+  const chord = sub(top, rim);
+  const chordLen = len(chord);
+  if (chordLen < 1e-15) throw new Error("rim and top coincide");
+  const u = norm(chord) as [number, number, number];
+  let planeN = cross(rim, chord);
+  if (len(planeN) < 1e-12) planeN = cross(chord, Z_UP);
+  planeN = norm(planeN);
+  let v = cross(chord, planeN);
+  if (len(v) < 1e-15) v = [0, 1, 0];
+  else v = norm(v);
+  if (dot(v, rim) < 0) v = scale(v, -1);
+  return { u, v, planeN };
+}
+
+/** +Z projected into the seam plane (rim,top plane): “straight up” at the rim vs chord slant. */
+function verticalUpInSeamPlane(planeN: Vec3): [number, number, number] {
+  const proj = projectOntoPlaneUnnormalized(Z_UP, planeN);
+  const L = len(proj);
+  if (L < 1e-15) return [0, 0, 1];
+  return [proj[0] / L, proj[1] / L, proj[2] / L];
+}
+
+/**
+ * Orthonormal (e1, e2) in the seam plane for bottom-angle mixing: e1 ≈ vertical, e2 ⟂ e1 toward bulge.
+ * `mix2d` assumes orthogonal axes; chord u and vertical-up are not always ⟂ to frame v.
+ */
+function bottomAngleMixBasis(
+  planeN: Vec3,
+  uChord: [number, number, number],
+  vBulge: [number, number, number],
+  useVerticalAsE1: boolean
+): { e1: [number, number, number]; e2: [number, number, number] } {
+  const e1 = useVerticalAsE1 ? verticalUpInSeamPlane(planeN) : uChord;
+  const vProj = sub(vBulge as Vec3, scale(e1 as Vec3, dot(vBulge as Vec3, e1)));
+  const L = len(vProj);
+  if (L >= 1e-12) {
+    return { e1, e2: [vProj[0] / L, vProj[1] / L, vProj[2] / L] };
+  }
+  const e2 = norm(cross(e1 as Vec3, planeN)) as [number, number, number];
+  return { e1, e2 };
+}
+
+/** Default cubic endpoint style matching legacy bulge scalar `squareness`. */
+export function defaultSeamEndpointStyleFromSquareness(squareness: number): SeamEndpointStyle {
+  const s = Math.min(1, Math.max(0, squareness));
+  return {
+    bottomStrength: s,
+    /** With plane lock: 0 = vertical (+Z in seam plane); π/2 = outward +v. */
+    bottomAngleRad: 0,
+    topStrength: s,
+    /** Used when plane lock is off, or as fallback if horizontal radial projects to zero. */
+    topAngleRad: 0.5 * Math.PI,
+    lockAnglesToSeamPlane: true,
+  };
+}
+
+function mix2d(
+  u: Vec3,
+  v: Vec3,
+  angleRad: number
+): [number, number, number] {
+  const ca = Math.cos(angleRad);
+  const sa = Math.sin(angleRad);
+  return norm([
+    ca * u[0] + sa * v[0],
+    ca * u[1] + sa * v[1],
+    ca * u[2] + sa * v[2],
+  ]) as [number, number, number];
+}
+
+function projectOntoPlaneUnnormalized(v: Vec3, planeN: Vec3): [number, number, number] {
+  const nn = norm(planeN);
+  return sub(v as Vec3, scale(nn, dot(v as Vec3, nn)));
+}
+
+function projectOntoPlaneDir(
+  d: [number, number, number],
+  planeN: Vec3
+): [number, number, number] {
+  const proj = projectOntoPlaneUnnormalized(d as Vec3, planeN);
+  const L = len(proj);
+  if (L < 1e-15) return [1, 0, 0];
+  return [proj[0] / L, proj[1] / L, proj[2] / L];
+}
+
+const ARC_LEN_SEGMENTS = 40;
+
+/** Cubic arc length (mesh + λ solve). Same segment count for both so λ matches the curve we render. */
+const CUBIC_ARC_LEN_SEGMENTS = 22;
+
+/** ~0.1 in absolute arc-length error is enough for interactive editing (metres). */
+const SEAM_ARC_LENGTH_TOL_M = 0.00254;
+
+/** Max bisection steps per seam λ solve (primary cubic + uniform-handle fallback). */
+const SEAM_LAMBDA_MAX_ITERS = 5;
+
+/** Unit vector in XY toward the crown point from the z-axis (horizontal “out” on the top ring). */
+export function horizontalRadialOutFromAxisAtTop(top: Vec3): [number, number, number] {
+  const x = top[0];
+  const y = top[1];
+  const r = Math.hypot(x, y);
+  if (r < 1e-12) return [1, 0, 0];
+  return [x / r, y / r, 0];
+}
+
+/**
+ * Horizontal “out” for the top seam handle: top ring direction in XY, or when the top is on the
+ * z-axis (button / apex), the same direction as the rim point in XY. Using a fixed +X fallback for
+ * all seams breaks mirror symmetry between left and right seams by a few mm of arc height.
+ */
+export function horizontalRadialOutForSeamTop(top: Vec3, rim: Vec3): [number, number, number] {
+  const x = top[0];
+  const y = top[1];
+  const r = Math.hypot(x, y);
+  if (r >= 1e-12) {
+    return [x / r, y / r, 0];
+  }
+  const rx = rim[0];
+  const ry = rim[1];
+  const rr = Math.hypot(rx, ry);
+  if (rr < 1e-12) return [1, 0, 0];
+  return [rx / rr, ry / rr, 0];
+}
+
+/**
+ * Endpoint tangents must have positive dot with chord +u (rim→top) so the cubic does not fold.
+ * Negating the whole handle flips the bulge side (+v); instead flip only the u component:
+ * |uu| u + vv v (u ⟂ v in the seam plane) preserves outward vs inward bulge.
+ */
+function alignHandleWithChordForwardPreservingBulge(
+  d: [number, number, number],
+  uChord: [number, number, number],
+  vBulge: [number, number, number]
+): [number, number, number] {
+  const uu = dot(d as Vec3, uChord);
+  const vv = dot(d as Vec3, vBulge);
+  if (uu >= -1e-9) {
+    return d;
+  }
+  const px = Math.abs(uu) * uChord[0] + vv * vBulge[0];
+  const py = Math.abs(uu) * uChord[1] + vv * vBulge[1];
+  const pz = Math.abs(uu) * uChord[2] + vv * vBulge[2];
+  const L = Math.hypot(px, py, pz);
+  if (L < 1e-12) {
+    return [uChord[0], uChord[1], uChord[2]];
+  }
+  return [px / L, py / L, pz / L];
+}
+
+export function seamHandleDirectionsFromStyle(
+  rim: Vec3,
+  top: Vec3,
+  style: SeamEndpointStyle
+): { dBottom: [number, number, number]; dTop: [number, number, number] } {
+  const { u, v, planeN } = seamPlaneFrameFromRimTop(rim, top);
+  const { e1, e2 } = bottomAngleMixBasis(planeN, u, v, style.lockAnglesToSeamPlane);
+  let d0 = mix2d(e1, e2, style.bottomAngleRad);
+  let d1: [number, number, number];
+  if (style.lockAnglesToSeamPlane) {
+    d0 = projectOntoPlaneDir(d0, planeN);
+    const hOut = horizontalRadialOutForSeamTop(top, rim);
+    const rawTop = projectOntoPlaneUnnormalized(hOut, planeN);
+    const rawLen = len(rawTop);
+    if (rawLen < 1e-10) {
+      d1 = projectOntoPlaneDir(mix2d(u, v, style.topAngleRad), planeN);
+    } else {
+      d1 = [rawTop[0] / rawLen, rawTop[1] / rawLen, rawTop[2] / rawLen];
+    }
+  } else {
+    d0 = norm(d0) as [number, number, number];
+    d1 = norm(mix2d(u, v, style.topAngleRad)) as [number, number, number];
+  }
+  d0 = alignHandleWithChordForwardPreservingBulge(d0, u, v);
+  d1 = alignHandleWithChordForwardPreservingBulge(d1, u, v);
+  return { dBottom: d0, dTop: d1 };
+}
+
+/** Build cubic with P1 = P0 + λ s0 d0, P2 = P3 − λ s1 d1. */
+export function buildSeamCubicWithLambda(
+  rim: Vec3,
+  top: Vec3,
+  style: SeamEndpointStyle,
+  lambda: number
+): [Vec3, Vec3, Vec3, Vec3] {
+  const { dBottom, dTop } = seamHandleDirectionsFromStyle(rim, top, style);
+  const p0: Vec3 = [rim[0], rim[1], rim[2]];
+  const p3: Vec3 = [top[0], top[1], top[2]];
+  const p1 = add(p0, scale(dBottom, lambda * style.bottomStrength));
+  const p2 = sub(p3, scale(dTop, lambda * style.topStrength));
+  return [p0, p1, p2, p3];
+}
+
+export function cubicBezierArcLength(
+  p0: Vec3,
+  p1: Vec3,
+  p2: Vec3,
+  p3: Vec3,
+  segments = CUBIC_ARC_LEN_SEGMENTS
+): number {
+  let L = 0;
+  let prev = evalCubicBezier(p0, p1, p2, p3, 0);
+  for (let i = 1; i <= segments; i++) {
+    const t = i / segments;
+    const cur = evalCubicBezier(p0, p1, p2, p3, t);
+    L += len(sub(cur, prev));
+    prev = cur;
+  }
+  return L;
+}
+
+/**
+ * Find λ ≥ 0 so cubic arc length ≈ target. Scales both handles equally.
+ */
+export function solveLambdaForSeamCubicArcLength(
+  rim: Vec3,
+  top: Vec3,
+  style: SeamEndpointStyle,
+  targetLength: number
+): number {
+  const chord = len(sub(top, rim));
+  if (chord < 1e-15) return 0;
+  const L0 = cubicBezierArcLength(...buildSeamCubicWithLambda(rim, top, style, 0));
+  if (targetLength <= L0 + 1e-9) return 0;
+
+  let hi = 1;
+  for (let k = 0; k < 6; k++) {
+    const L = cubicBezierArcLength(...buildSeamCubicWithLambda(rim, top, style, hi));
+    if (L >= targetLength) break;
+    hi *= 2;
+    if (hi > 1e6) break;
+  }
+
+  let lo = 0;
+  const hiL = cubicBezierArcLength(...buildSeamCubicWithLambda(rim, top, style, hi));
+  if (hiL < targetLength) {
+    return hi;
+  }
+
+  for (let i = 0; i < SEAM_LAMBDA_MAX_ITERS; i++) {
+    const mid = 0.5 * (lo + hi);
+    const L = cubicBezierArcLength(...buildSeamCubicWithLambda(rim, top, style, mid));
+    if (Math.abs(L - targetLength) <= SEAM_ARC_LENGTH_TOL_M) {
+      return mid;
+    }
+    if (L < targetLength) lo = mid;
+    else hi = mid;
+  }
+  return 0.5 * (lo + hi);
+}
+
+/**
+ * Quadratic → cubic degree elevation (same curve, new control points).
+ * See e.g. Farin, Curves and Surfaces for CAGD.
+ */
+export function elevateQuadraticBezierToCubic(
+  q0: Vec3,
+  q1: Vec3,
+  q2: Vec3
+): [Vec3, Vec3, Vec3, Vec3] {
+  const c0: Vec3 = [q0[0], q0[1], q0[2]];
+  const c3: Vec3 = [q2[0], q2[1], q2[2]];
+  const c1 = add(c0, scale(sub(q1, q0), 2 / 3));
+  const c2 = add(c3, scale(sub(q1, q2), 2 / 3));
+  return [c0, c1, c2, c3];
+}
+
+/** True if every sample on the cubic stays at least as far from the z-axis as the straight chord (outward bulge vs chord). */
+function cubicSeamStaysOutwardVsChord(
+  p0: Vec3,
+  p1: Vec3,
+  p2: Vec3,
+  p3: Vec3,
+  rim: Vec3,
+  top: Vec3
+): boolean {
+  const eps = 2e-7;
+  for (let s = 1; s < 40; s++) {
+    const t = s / 40;
+    const p = evalCubicBezier(p0, p1, p2, p3, t);
+    const q: Vec3 = [
+      rim[0] + t * (top[0] - rim[0]),
+      rim[1] + t * (top[1] - rim[1]),
+      rim[2] + t * (top[2] - rim[2]),
+    ];
+    const rp = Math.hypot(p[0], p[1]);
+    const rq = Math.hypot(q[0], q[1]);
+    if (rq < 1e-5) continue;
+    if (rp < rq - eps) return false;
+  }
+  return true;
+}
+
+/**
+ * Scale both handles uniformly: P1' = P0 + λ(P1−P0), P2' = P3 − λ(P3−P2), λ ∈ [0,1] for shortening.
+ * Used to match arc length on a fixed-shape cubic (e.g. degree-elevated quadratic).
+ */
+export function solveLambdaUniformCubicHandles(
+  p0: Vec3,
+  p1: Vec3,
+  p2: Vec3,
+  p3: Vec3,
+  targetLength: number
+): number {
+  const LAt = (lam: number): number => {
+    const p1s = add(p0, scale(sub(p1, p0), lam));
+    const p2s = sub(p3, scale(sub(p3, p2), lam));
+    return cubicBezierArcLength(p0, p1s, p2s, p3);
+  };
+  const chordLen = len(sub(p3, p0));
+  if (chordLen < 1e-15) return 0;
+  const L0 = LAt(0);
+  if (targetLength <= L0 + 1e-9) return 0;
+
+  let hi = 1;
+  let Lhi = LAt(hi);
+  if (targetLength > Lhi + 1e-9) {
+    for (let k = 0; k < 12; k++) {
+      Lhi = LAt(hi);
+      if (Lhi >= targetLength - 1e-9) break;
+      hi *= 2;
+      if (hi > 1e6) break;
+    }
+  }
+  if (LAt(hi) < targetLength - 1e-9) {
+    return hi;
+  }
+  let lo = 0;
+  for (let i = 0; i < SEAM_LAMBDA_MAX_ITERS; i++) {
+    const mid = 0.5 * (lo + hi);
+    const L = LAt(mid);
+    if (Math.abs(L - targetLength) <= SEAM_ARC_LENGTH_TOL_M) {
+      return mid;
+    }
+    if (L < targetLength) lo = mid;
+    else hi = mid;
+  }
+  return 0.5 * (lo + hi);
+}
+
+export function buildSeamCubicControlPoints(
+  rim: Vec3,
+  top: Vec3,
+  style: SeamEndpointStyle,
+  targetArcLength: number
+): [Vec3, Vec3, Vec3, Vec3] {
+  const lam = solveLambdaForSeamCubicArcLength(rim, top, style, targetArcLength);
+  const primary = buildSeamCubicWithLambda(rim, top, style, lam);
+  const [a0, a1, a2, a3] = primary;
+  const outward = cubicSeamStaysOutwardVsChord(a0, a1, a2, a3, rim, top);
+  if (outward) {
+    return primary;
+  }
+  const s = Math.min(1, Math.max(0, 0.5 * (style.bottomStrength + style.topStrength)));
+  const [q0, q1, q2] = seamQuadraticBezier(rim, top, s);
+  const [c0, c1, c2, c3] = elevateQuadraticBezierToCubic(q0, q1, q2);
+  const lamU = solveLambdaUniformCubicHandles(c0, c1, c2, c3, targetArcLength);
+  const p1 = add(c0, scale(sub(c1, c0), lamU));
+  const p2 = sub(c3, scale(sub(c3, c2), lamU));
+  return [c0, p1, p2, c3];
+}
+
+/** Unit normal for the plane containing rim, vPoint, top (front V). */
+export function vSplitPlaneNormal(rim: Vec3, vPoint: Vec3, top: Vec3): [number, number, number] {
+  const a = sub(vPoint, rim);
+  const b = sub(top, vPoint);
+  let n = cross(a, b);
+  if (len(n) < 1e-12) n = cross(rim, sub(top, rim));
+  if (len(n) < 1e-12) return [0, 0, 1];
+  return norm(n);
+}
+
+function quadLegInPlane(
+  p0: Vec3,
+  p2: Vec3,
+  strength: number,
+  planeN: Vec3
+): [Vec3, Vec3, Vec3] {
+  const chord = sub(p2, p0);
+  const L = len(chord);
+  if (L < 1e-15) {
+    return [[p0[0], p0[1], p0[2]], [p0[0], p0[1], p0[2]], [p2[0], p2[1], p2[2]]];
+  }
+  const uDir = scale(chord, 1 / L);
+  let perp = cross(planeN, uDir);
+  if (len(perp) < 1e-12) perp = cross(uDir, Z_UP);
+  perp = norm(perp);
+  if (dot(perp, p0) < 0) perp = scale(perp, -1);
+  const mid = scale(add(p0, p2), 0.5);
+  const p1 = add(mid, scale(perp, strength * L));
+  return [p0, p1, p2];
+}
+
+export function buildVSplitQuadraticLegs(
+  rim: Vec3,
+  top: Vec3,
+  vPoint: Vec3,
+  legBottomStrength: number,
+  legTopStrength: number
+): { lower: [Vec3, Vec3, Vec3]; upper: [Vec3, Vec3, Vec3]; tSplit: number } {
+  const planeN = vSplitPlaneNormal(rim, vPoint, top);
+  const lower = quadLegInPlane(rim, vPoint, legBottomStrength, planeN);
+  const upper = quadLegInPlane(vPoint, top, legTopStrength, planeN);
+  const L1 = quadraticBezierArcLength(lower[0], lower[1], lower[2]);
+  const L2 = quadraticBezierArcLength(upper[0], upper[1], upper[2]);
+  const total = L1 + L2;
+  const tSplit = total > 1e-15 ? L1 / total : 0.5;
+  return { lower, upper, tSplit };
+}
+
+function evalVQuadraticLegsAt(
+  lower: [Vec3, Vec3, Vec3],
+  upper: [Vec3, Vec3, Vec3],
+  tSplit: number,
+  t: number
+): [number, number, number] {
+  if (t <= tSplit + 1e-15) {
+    const u = tSplit < 1e-12 ? 0 : t / tSplit;
+    return evalQuadraticBezier(lower[0], lower[1], lower[2], Math.min(1, Math.max(0, u)));
+  }
+  const u =
+    1 - tSplit < 1e-12 ? 1 : (t - tSplit) / (1 - tSplit);
+  return evalQuadraticBezier(upper[0], upper[1], upper[2], Math.min(1, Math.max(0, u)));
+}
 
 /** Polyline length of a quadratic Bézier (uniform t samples). */
 export function quadraticBezierArcLength(
@@ -444,13 +898,20 @@ export function evalSeamCurve(curve: SeamCurve, t: number): [number, number, num
     const [p0, p1, p2] = curve.ctrl;
     return evalQuadraticBezier(p0, p1, p2, t);
   }
+  if (curve.kind === "cubic") {
+    const [p0, p1, p2, p3] = curve.ctrl;
+    return evalCubicBezier(p0, p1, p2, p3, t);
+  }
   if (curve.kind === "superellipse") {
     const { rim, top, n, bulgeFraction } = curve;
     return evalSeamSuperellipse(rim, top, n, bulgeFraction, t);
   }
   if (curve.kind === "vSplit") {
-    const { rim, top, vPoint, blend, baseCurve, tSplit } = curve;
-    const vPos = evalVPath(rim, top, vPoint, tSplit, t);
+    const { rim, top, vPoint, blend, baseCurve, tSplit, legBottomStrength, legTopStrength } = curve;
+    const vPos =
+      legBottomStrength <= 1e-12 && legTopStrength <= 1e-12
+        ? evalVPath(rim, top, vPoint, tSplit, t)
+        : evalVQuadraticLegsAt(curve.lowerQuad, curve.upperQuad, curve.arcLenTSplit, t);
     if (blend >= 1 - 1e-9) return vPos;
     const bPos = evalQuadraticBezier(baseCurve[0], baseCurve[1], baseCurve[2], t);
     if (blend <= 1e-9) return bPos;
@@ -651,6 +1112,47 @@ export function effectiveSquarenessForSeam(spec: HatSkeletonSpec, seamIndex: num
   return Math.min(1, Math.max(0, spec.seamSquareness));
 }
 
+export function resolveSeamEndpointStyleForIndex(
+  spec: HatSkeletonSpec,
+  seamIndex: number
+): SeamEndpointStyle {
+  const eps = spec.seamEndpointStyles;
+  if (eps.length > seamIndex && eps[seamIndex]) {
+    return eps[seamIndex]!;
+  }
+  return defaultSeamEndpointStyleFromSquareness(effectiveSquarenessForSeam(spec, seamIndex));
+}
+
+/** Target arc length (m) for cubic seam: explicit, else legacy quadratic length at current squareness. */
+export function resolveSeamTargetArcLengthForIndex(
+  spec: HatSkeletonSpec,
+  seamIndex: number,
+  rim: Vec3,
+  top: Vec3
+): number {
+  const arr = spec.seamTargetArcLengthM;
+  if (arr.length > seamIndex && arr[seamIndex] != null && arr[seamIndex]! > 1e-12) {
+    return arr[seamIndex]!;
+  }
+  const s = effectiveSquarenessForSeam(spec, seamIndex);
+  return arcLengthOfSeamQuadratic(rim, top, s);
+}
+
+export function blendSeamEndpointStyles(
+  a: SeamEndpointStyle,
+  b: SeamEndpointStyle,
+  t: number
+): SeamEndpointStyle {
+  const w = Math.max(0, Math.min(1, t));
+  return {
+    bottomStrength: a.bottomStrength * (1 - w) + b.bottomStrength * w,
+    bottomAngleRad: a.bottomAngleRad * (1 - w) + b.bottomAngleRad * w,
+    topStrength: a.topStrength * (1 - w) + b.topStrength * w,
+    topAngleRad: a.topAngleRad * (1 - w) + b.topAngleRad * w,
+    lockAnglesToSeamPlane: w < 0.5 ? a.lockAnglesToSeamPlane : b.lockAnglesToSeamPlane,
+  };
+}
+
 export function seamSquarenessForIndex(
   base: number,
   overrides: (number | null)[],
@@ -752,6 +1254,69 @@ export interface BuiltSkeleton {
   visorPolyline: [number, number, number][];
 }
 
+const SEAM_REUSE_VEC_EPS = 1e-7;
+const SEAM_REUSE_LEN_EPS = 1e-6;
+
+function vec3Close(a: Vec3, b: Vec3, eps: number): boolean {
+  return (
+    Math.abs(a[0] - b[0]) <= eps &&
+    Math.abs(a[1] - b[1]) <= eps &&
+    Math.abs(a[2] - b[2]) <= eps
+  );
+}
+
+function seamEndpointStylesEqual(a: SeamEndpointStyle, b: SeamEndpointStyle): boolean {
+  const e = SEAM_REUSE_LEN_EPS;
+  return (
+    Math.abs(a.bottomStrength - b.bottomStrength) <= e &&
+    Math.abs(a.bottomAngleRad - b.bottomAngleRad) <= e &&
+    Math.abs(a.topStrength - b.topStrength) <= e &&
+    Math.abs(a.topAngleRad - b.topAngleRad) <= e &&
+    a.lockAnglesToSeamPlane === b.lockAnglesToSeamPlane
+  );
+}
+
+/** Top endpoint for panel `i`; must match `buildSkeleton` seam top logic. */
+function seamTopEndForSpec(spec: HatSkeletonSpec, angles: Float64Array, i: number): Vec3 {
+  const topFrac = spec.topRimFraction;
+  if (topFrac <= 1e-12) {
+    return [0, 0, spec.crownHeight];
+  }
+  return topRimPoint(
+    angles[i]!,
+    spec.semiAxisX,
+    spec.semiAxisY,
+    spec.yawRad,
+    spec.crownHeight,
+    topFrac
+  ) as Vec3;
+}
+
+function canReuseCubicSeamFromPrev(
+  prev: BuiltSkeleton,
+  i: number,
+  spec: HatSkeletonSpec,
+  angles: Float64Array,
+  rim: Vec3,
+  topEnd: Vec3,
+  useArcLength: boolean,
+  useSuperellipse: boolean
+): boolean {
+  if (useArcLength || useSuperellipse) return false;
+  if (spec.seamCurveMode !== "squareness" || prev.spec.seamCurveMode !== "squareness") return false;
+  const pc = prev.seamControls[i];
+  if (!pc || pc.kind !== "cubic") return false;
+  if (!vec3Close(rim, prev.rimPoints[i]!, SEAM_REUSE_VEC_EPS)) return false;
+  const prevTop = seamTopEndForSpec(prev.spec, prev.angles, i);
+  if (!vec3Close(topEnd, prevTop, SEAM_REUSE_VEC_EPS)) return false;
+  const st = resolveSeamEndpointStyleForIndex(spec, i);
+  const pst = resolveSeamEndpointStyleForIndex(prev.spec, i);
+  if (!seamEndpointStylesEqual(st, pst)) return false;
+  const t1 = resolveSeamTargetArcLengthForIndex(spec, i, rim, topEnd);
+  const t2 = resolveSeamTargetArcLengthForIndex(prev.spec, i, prev.rimPoints[i]!, prevTop);
+  return Math.abs(t1 - t2) <= SEAM_REUSE_LEN_EPS;
+}
+
 export function sweatbandPolyline(
   spec: HatSkeletonSpec,
   samples: number
@@ -772,7 +1337,17 @@ export function sampleSeam(
   return sampleSeamCurve({ kind: "bezier", ctrl: controls }, segments);
 }
 
-export function buildSkeleton(spec: HatSkeletonSpec): BuiltSkeleton {
+export function buildSkeleton(
+  spec: HatSkeletonSpec,
+  prevBuilt?: BuiltSkeleton | null
+): BuiltSkeleton {
+  const prev =
+    prevBuilt &&
+    prevBuilt.spec.nSeams === spec.nSeams &&
+    prevBuilt.spec.seamCurveMode === spec.seamCurveMode
+      ? prevBuilt
+      : null;
+
   const apex: Vec3 = [0, 0, spec.crownHeight];
   const angles =
     spec.seamAnglesRad !== null
@@ -814,6 +1389,15 @@ export function buildSkeleton(spec: HatSkeletonSpec): BuiltSkeleton {
     if (vs && i === frontSeamIdx) {
       const totalL = vs.baseLengthM + vs.topLengthM;
       const tSplit = totalL > 1e-12 ? vs.baseLengthM / totalL : 0.5;
+      const lb = vs.legBottomStrength ?? 0;
+      const lt = vs.legTopStrength ?? 0;
+      const { lower, upper, tSplit: arcLenTSplit } = buildVSplitQuadraticLegs(
+        rim,
+        topEnd,
+        vs.vPoint,
+        lb,
+        lt
+      );
       seamControls.push({
         kind: "vSplit",
         rim,
@@ -822,6 +1406,11 @@ export function buildSkeleton(spec: HatSkeletonSpec): BuiltSkeleton {
         blend: vs.blend,
         baseCurve: [rim, vs.vPoint, topEnd],
         tSplit,
+        legBottomStrength: lb,
+        legTopStrength: lt,
+        lowerQuad: lower,
+        upperQuad: upper,
+        arcLenTSplit,
       });
       continue;
     }
@@ -852,7 +1441,17 @@ export function buildSkeleton(spec: HatSkeletonSpec): BuiltSkeleton {
         const { visor, crown, splitT } = spec.fivePanelFrontSeams;
         seamControls.push(buildSplitSeamCurve(rim, topEnd, visor, crown, splitT));
       } else {
-        seamControls.push({ kind: "bezier", ctrl: seamQuadraticBezier(rim, topEnd, s) });
+        const style = resolveSeamEndpointStyleForIndex(spec, i);
+        const targetLen = resolveSeamTargetArcLengthForIndex(spec, i, rim, topEnd);
+        if (
+          prev &&
+          canReuseCubicSeamFromPrev(prev, i, spec, angles, rim, topEnd, useArcLength, useSuperellipse)
+        ) {
+          seamControls.push(prev.seamControls[i]!);
+        } else {
+          const ctrl = buildSeamCubicControlPoints(rim, topEnd, style, targetLen);
+          seamControls.push({ kind: "cubic", ctrl });
+        }
       }
     }
   }

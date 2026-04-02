@@ -1,13 +1,13 @@
-import type { HatMeasurementTargets, HatSkeletonSpec } from "./types";
+import type { HatMeasurementTargets, HatSkeletonSpec, PanelCount } from "./types";
 import { mergeHatSpecDefaults, MIN_TOP_RIM_FRACTION_WITH_FRONT_VSPLIT } from "./types";
 import {
+  measurementTargetsFromSpec,
   seamGroupIndices,
   sweatbandCircumference,
   visorLengthFromSpec,
   visorSpanFromSpec,
 } from "./measurements";
 import {
-  arcLengthOfSeamQuadratic,
   panelSeamAngles,
   solveVPoint,
   sweatbandPoint,
@@ -118,73 +118,24 @@ export function solveVisorOutsetForSpan(
 }
 
 /**
- * Stage C: for each seam group independently, solve squareness (bulge)
- * so that the arc length of each seam matches the target. Other groups
- * are unaffected because each solve only touches that group's bulge.
+ * Stage C: assign target arc length per seam index (cubic λ-solve in `buildSkeleton`).
+ * Mirrored seams in a group share the same length target.
  */
-function solveSquarenessForTargetArcLength(
-  rim: Vec3,
-  top: Vec3,
-  target: number
-): number {
-  const L0 = arcLengthOfSeamQuadratic(rim, top, 0);
-  if (target <= L0) return 0;
-  const L1 = arcLengthOfSeamQuadratic(rim, top, 1);
-  if (target >= L1) return 1;
-  let lo = 0;
-  let hi = 1;
-  for (let i = 0; i < BISECT_ITERS; i++) {
-    const mid = 0.5 * (lo + hi);
-    const L = arcLengthOfSeamQuadratic(rim, top, mid);
-    if (L < target) lo = mid;
-    else hi = mid;
-  }
-  return 0.5 * (lo + hi);
-}
-
-function solveSeamGroupSquareness(
-  spec: HatSkeletonSpec,
+function seamTargetArcLengthsFromGroups(
+  nSeams: import("./types").PanelCount,
   targets: { front: number; sideFront: number; sideBack: number; rear: number }
 ): (number | null)[] {
-  const angles =
-    spec.seamAnglesRad !== null
-      ? Float64Array.from(spec.seamAnglesRad)
-      : panelSeamAngles(spec.nSeams);
-  const topFrac = spec.topRimFraction;
-  const apex: Vec3 = [0, 0, spec.crownHeight];
-
-  const rimOf = (i: number): Vec3 =>
-    sweatbandPoint(angles[i]!, spec.semiAxisX, spec.semiAxisY, spec.yawRad);
-
-  const topOf = (i: number): Vec3 => {
-    if (topFrac <= 1e-12) return apex;
-    return topRimPoint(
-      angles[i]!,
-      spec.semiAxisX,
-      spec.semiAxisY,
-      spec.yawRad,
-      spec.crownHeight,
-      topFrac
-    );
+  const g = seamGroupIndices(nSeams);
+  const out: (number | null)[] = new Array(nSeams).fill(null);
+  const set = (indices: number[], len: number) => {
+    if (indices.length === 0 || len <= 0) return;
+    for (const i of indices) out[i] = len;
   };
-
-  const g = seamGroupIndices(spec.nSeams);
-  const overrides: (number | null)[] = new Array(spec.nSeams).fill(null);
-
-  const solveGroup = (indices: number[], target: number) => {
-    if (indices.length === 0 || target <= 0) return;
-    for (const i of indices) {
-      const s = solveSquarenessForTargetArcLength(rimOf(i), topOf(i), target);
-      overrides[i] = s;
-    }
-  };
-
-  solveGroup(g.front, targets.front);
-  solveGroup(g.sideFront, targets.sideFront);
-  solveGroup(g.sideBack, targets.sideBack);
-  solveGroup(g.rear, targets.rear);
-
-  return overrides;
+  set(g.front, targets.front);
+  set(g.sideFront, targets.sideFront);
+  set(g.sideBack, targets.sideBack);
+  set(g.rear, targets.rear);
+  return out;
 }
 
 /**
@@ -192,7 +143,7 @@ function solveSeamGroupSquareness(
  * 1. Base circumference → uniform scale of semi-axes (preserves Y/X ratio)
  * 2. Visor length → solve projection
  * 3. Visor width → solve rimOutsetBeyondSeamRad (left-to-right span)
- * 4. Seam arc lengths per group → solve per-seam squareness (independent)
+ * 4. Seam arc lengths per group → `seamTargetArcLengthM` (cubic λ-solve in build)
  * 5. Front V-split: compute V-point from two straight-line lengths (when split mode)
  */
 export function solveHatSpecFromMeasurements(
@@ -222,7 +173,7 @@ export function solveHatSpecFromMeasurements(
     ? targets.seamFrontBaseLengthM + targets.seamFrontTopLengthM
     : targets.seamEdgeLengthFrontM;
 
-  const overrides = solveSeamGroupSquareness(spec, {
+  const seamTargetArcLengthM = seamTargetArcLengthsFromGroups(spec.nSeams, {
     front: frontTarget,
     sideFront: targets.seamEdgeLengthSideFrontM,
     sideBack: targets.seamEdgeLengthSideBackM,
@@ -230,7 +181,8 @@ export function solveHatSpecFromMeasurements(
   });
   spec = {
     ...spec,
-    seamSquarenessOverrides: overrides,
+    seamSquarenessOverrides: [],
+    seamTargetArcLengthM,
     seamCurveMode: "squareness",
   };
 
@@ -256,11 +208,164 @@ export function solveHatSpecFromMeasurements(
         blend: targets.frontSplitBlend,
         baseLengthM: targets.seamFrontBaseLengthM,
         topLengthM: targets.seamFrontTopLengthM,
+        legBottomStrength: spec.frontVSplit?.legBottomStrength ?? 0,
+        legTopStrength: spec.frontVSplit?.legTopStrength ?? 0,
       },
     };
   } else {
     spec = { ...spec, frontVSplit: null };
   }
+
+  return mergeHatSpecDefaults(spec);
+}
+
+/** Metres / dimensionless; skip solver work when nothing material changed. */
+const MT_EPS_M = 0.00005;
+
+function mChanged(a: number, b: number): boolean {
+  return Math.abs(a - b) > MT_EPS_M;
+}
+
+/**
+ * True when `next` measurement inputs are identical to `lastApplied` for solver purposes.
+ */
+export function measurementTargetsEqualApprox(
+  a: HatMeasurementTargets,
+  b: HatMeasurementTargets
+): boolean {
+  if (a.frontSeamMode !== b.frontSeamMode) return false;
+  if (mChanged(a.baseCircumferenceM, b.baseCircumferenceM)) return false;
+  if (mChanged(a.visorLengthM, b.visorLengthM)) return false;
+  if (mChanged(a.visorWidthM, b.visorWidthM)) return false;
+  if (mChanged(a.seamEdgeLengthFrontM, b.seamEdgeLengthFrontM)) return false;
+  if (mChanged(a.seamFrontBaseLengthM, b.seamFrontBaseLengthM)) return false;
+  if (mChanged(a.seamFrontTopLengthM, b.seamFrontTopLengthM)) return false;
+  if (mChanged(a.frontSplitBlend, b.frontSplitBlend)) return false;
+  if (mChanged(a.seamEdgeLengthSideFrontM, b.seamEdgeLengthSideFrontM)) return false;
+  if (mChanged(a.seamEdgeLengthSideBackM, b.seamEdgeLengthSideBackM)) return false;
+  if (mChanged(a.seamEdgeLengthRearM, b.seamEdgeLengthRearM)) return false;
+  return true;
+}
+
+/**
+ * Skip re-running the measurement solver when the UI targets match what we last applied and the
+ * current spec already matches those targets (avoids redundant work when the user has not changed
+ * measurements, or catches drift after manual edits).
+ */
+export function shouldSkipMeasurementSolve(
+  spec: HatSkeletonSpec,
+  lastAppliedMeasurementTargets: HatMeasurementTargets | null,
+  nextMeasurementTargets: HatMeasurementTargets
+): boolean {
+  if (lastAppliedMeasurementTargets === null) return false;
+  if (!measurementTargetsEqualApprox(lastAppliedMeasurementTargets, nextMeasurementTargets)) {
+    return false;
+  }
+  return measurementTargetsEqualApprox(measurementTargetsFromSpec(spec), nextMeasurementTargets);
+}
+
+/** True when `solveHatSpecFromMeasurements` must run (split, mode change, or split fields). */
+function needsFullMeasurementSolve(
+  prev: HatMeasurementTargets | null,
+  next: HatMeasurementTargets
+): boolean {
+  if (prev === null) return true;
+  if (prev.frontSeamMode !== next.frontSeamMode) return true;
+  if (next.frontSeamMode === "split" || prev.frontSeamMode === "split") return true;
+  return false;
+}
+
+function mergeSeamArcLengthsByGroupChanges(
+  prevSpec: HatSkeletonSpec,
+  fullNext: (number | null)[],
+  prevTargets: HatMeasurementTargets,
+  nextTargets: HatMeasurementTargets,
+  nSeams: PanelCount
+): (number | null)[] {
+  const prevArr = prevSpec.seamTargetArcLengthM;
+  if (!prevArr || prevArr.length !== nSeams) {
+    return [...fullNext];
+  }
+  const g = seamGroupIndices(nSeams);
+  const out: (number | null)[] = new Array(nSeams).fill(null);
+  const takeFromFull = (indices: number[], groupChanged: boolean) => {
+    for (const i of indices) {
+      out[i] = groupChanged ? fullNext[i]! : prevArr[i] ?? fullNext[i]!;
+    }
+  };
+  takeFromFull(
+    g.front,
+    mChanged(prevTargets.seamEdgeLengthFrontM, nextTargets.seamEdgeLengthFrontM)
+  );
+  takeFromFull(
+    g.sideFront,
+    mChanged(prevTargets.seamEdgeLengthSideFrontM, nextTargets.seamEdgeLengthSideFrontM)
+  );
+  takeFromFull(
+    g.sideBack,
+    mChanged(prevTargets.seamEdgeLengthSideBackM, nextTargets.seamEdgeLengthSideBackM)
+  );
+  takeFromFull(
+    g.rear,
+    mChanged(prevTargets.seamEdgeLengthRearM, nextTargets.seamEdgeLengthRearM)
+  );
+  return out;
+}
+
+/**
+ * Apply measurement targets with minimal recomputation: only run semi-axes / visor bisection
+ * when those inputs change; only overwrite `seamTargetArcLengthM` for seam groups whose
+ * target length changed.
+ *
+ * Falls back to {@link solveHatSpecFromMeasurements} when front split mode is involved or
+ * `prevTargets` is null.
+ */
+export function solveHatSpecFromMeasurementsIncremental(
+  prevSpec: HatSkeletonSpec,
+  prevTargets: HatMeasurementTargets | null,
+  nextTargets: HatMeasurementTargets
+): HatSkeletonSpec {
+  if (needsFullMeasurementSolve(prevTargets, nextTargets)) {
+    return solveHatSpecFromMeasurements(prevSpec, nextTargets);
+  }
+  const prevT = prevTargets!;
+  let spec = mergeHatSpecDefaults(prevSpec);
+  const nSeams = spec.nSeams;
+
+  if (mChanged(prevT.baseCircumferenceM, nextTargets.baseCircumferenceM)) {
+    const { semiAxisX, semiAxisY } = solveSemiAxesForCircumference(spec, nextTargets.baseCircumferenceM);
+    spec = { ...spec, semiAxisX, semiAxisY };
+  }
+
+  if (mChanged(prevT.visorLengthM, nextTargets.visorLengthM)) {
+    const projection = solveVisorProjectionForLength(spec, nextTargets.visorLengthM);
+    spec = { ...spec, visor: { ...spec.visor, projection } };
+  }
+
+  if (mChanged(prevT.visorWidthM, nextTargets.visorWidthM)) {
+    const outset = solveVisorOutsetForSpan(spec, nextTargets.visorWidthM);
+    spec = {
+      ...spec,
+      visor: { ...spec.visor, rimOutsetBeyondSeamRad: outset, halfSpanRad: Math.PI },
+    };
+  }
+
+  const fullNext = seamTargetArcLengthsFromGroups(nSeams, {
+    front: nextTargets.seamEdgeLengthFrontM,
+    sideFront: nextTargets.seamEdgeLengthSideFrontM,
+    sideBack: nextTargets.seamEdgeLengthSideBackM,
+    rear: nextTargets.seamEdgeLengthRearM,
+  });
+
+  const merged = mergeSeamArcLengthsByGroupChanges(spec, fullNext, prevT, nextTargets, nSeams);
+
+  spec = {
+    ...spec,
+    seamSquarenessOverrides: [],
+    seamTargetArcLengthM: merged,
+    seamCurveMode: "squareness",
+    frontVSplit: null,
+  };
 
   return mergeHatSpecDefaults(spec);
 }

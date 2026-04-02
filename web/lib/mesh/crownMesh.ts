@@ -2,6 +2,7 @@ import * as THREE from "three";
 import type { HatSkeletonSpec } from "@/lib/skeleton/types";
 import type { BuiltSkeleton } from "@/lib/skeleton/geometry";
 import {
+  evalCubicBezier,
   evalQuadraticBezier,
   evalSeamCurve,
   evalSeamSuperellipse,
@@ -148,6 +149,11 @@ function topEndForTheta(sk: BuiltSkeleton, theta: number): [number, number, numb
   );
 }
 
+/**
+ * Crown vertex at grid position (panel, jArc, kRing). Edges (j=0, j=M) evaluate the seam curves
+ * directly. Interior vertices in squareness/cubic mode use the ruled surface between the two seam
+ * curves with an additive ellipse correction so the rim follows the sweatband.
+ */
 export function panelVertex(
   sk: BuiltSkeleton,
   panel: number,
@@ -211,11 +217,59 @@ export function panelVertex(
     return evalQuadraticBezier(p0, p1, p2, u);
   }
 
-  const sL = effectiveSquarenessForSeam(spec, panel);
-  const sR = effectiveSquarenessForSeam(spec, (panel + 1) % n);
-  const squareness = sL * (1 - blend) + sR * blend;
-  const [p0, p1, p2] = seamQuadraticBezier(rim, topEnd, squareness);
-  return evalQuadraticBezier(p0, p1, p2, u);
+  return ruledSurfaceWithEllipseCorrection(sk, panel, jArc, kRing, M, N);
+}
+
+/**
+ * Catmull-Rom through **all** seam positions at a given height, with an additive ellipse
+ * correction so the bottom row matches the sweatband exactly. The CR spline gives C1
+ * tangent continuity at every seam boundary, eliminating the visible creases that the
+ * old linear (ruled-surface) blend produced.
+ */
+function ruledSurfaceWithEllipseCorrection(
+  sk: BuiltSkeleton,
+  panel: number,
+  jArc: number,
+  kRing: number,
+  M: number,
+  N: number
+): [number, number, number] {
+  const n = sk.spec.nSeams;
+  const u = kRing / N;
+  const blend = jArc / M;
+  const spec = sk.spec;
+
+  const ring: [number, number, number][] = [];
+  for (let i = 0; i < n; i++) {
+    ring.push(evalSeamCurve(sk.seamControls[i]!, u));
+  }
+  const crPt = catmullRomClosed(ring, panel, blend);
+
+  const theta = panelInteriorTheta(sk.angles, panel, jArc, M);
+  const rimOnEllipse = sweatbandPoint(theta, spec.semiAxisX, spec.semiAxisY, spec.yawRad);
+  const rimCR = catmullRomClosed(sk.rimPoints, panel, blend);
+
+  const fade = (1 - u) * (1 - u);
+  return [
+    crPt[0] + (rimOnEllipse[0] - rimCR[0]) * fade,
+    crPt[1] + (rimOnEllipse[1] - rimCR[1]) * fade,
+    crPt[2] + (rimOnEllipse[2] - rimCR[2]) * fade,
+  ];
+}
+
+/**
+ * Same construction as the crown mesh interior: ruled surface + ellipse correction.
+ * Exported for debug overlay in {@link buildHatGroup}.
+ */
+export function ruledSurfaceVertexBetweenSeams(
+  sk: BuiltSkeleton,
+  panel: number,
+  jArc: number,
+  kRing: number,
+  M: number,
+  N: number
+): [number, number, number] {
+  return ruledSurfaceWithEllipseCorrection(sk, panel, jArc, kRing, M, N);
 }
 
 function lerp3(
@@ -224,6 +278,30 @@ function lerp3(
   t: number
 ): [number, number, number] {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+}
+
+/**
+ * Uniform Catmull-Rom on a **closed** ring of points.
+ * `segment` = panel index, `t ∈ [0,1]` within that panel.
+ * At t=0 → pts[segment], t=1 → pts[(segment+1)%n], with C1 continuity at every knot.
+ */
+function catmullRomClosed(
+  pts: [number, number, number][],
+  segment: number,
+  t: number
+): [number, number, number] {
+  const n = pts.length;
+  const p0 = pts[((segment - 1) % n + n) % n]!;
+  const p1 = pts[segment % n]!;
+  const p2 = pts[(segment + 1) % n]!;
+  const p3 = pts[(segment + 2) % n]!;
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return [
+    0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
+    0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3),
+    0.5 * (2 * p1[2] + (-p0[2] + p2[2]) * t + (2 * p0[2] - 5 * p1[2] + 4 * p2[2] - p3[2]) * t2 + (-p0[2] + 3 * p1[2] - 3 * p2[2] + p3[2]) * t3),
+  ];
 }
 
 function normalizeAngle(theta: number): number {

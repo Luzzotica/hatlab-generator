@@ -47,6 +47,27 @@ export interface SixPanelSeamSquareness {
 }
 
 /**
+ * Cubic seam endpoint intent (rim → top): strengths scale handle lengths before λ enforces arc length.
+ * Bottom angle mixes vertical (+Z in seam plane) vs outward +v when plane lock is on; chord +u vs +v when off.
+ * With plane lock, the top handle uses horizontal radial outward (in XY, projected into the seam plane).
+ */
+export interface SeamEndpointStyle {
+  /** Scale on the rim → P1 handle (before λ). */
+  bottomStrength: number;
+  /**
+   * Angle in seam plane between “vertical” and outward bulge (+v): with plane lock, 0 = +Z
+   * projected into the seam plane (straight up at the rim); π/2 = pure +v. Without lock, 0 = chord +u.
+   */
+  bottomAngleRad: number;
+  /** Scale on the P2 → top handle (before λ). */
+  topStrength: number;
+  /** When plane lock is off: angle in seam plane for (P3−P2). Ignored at top when lock is on. */
+  topAngleRad: number;
+  /** If true: bottom uses angles in seam plane; top uses horizontal-out (projected). If false: full 3D. */
+  lockAnglesToSeamPlane: boolean;
+}
+
+/**
  * 5-panel: the two front panel edges (seam 0 & 1) split into a lower (visor) and upper (crown) curve.
  * `splitT` is the fraction along rim→apex where the two quadratics meet.
  */
@@ -113,6 +134,16 @@ export interface HatSkeletonSpec {
   seamSuperellipseN: number;
   seamSquareness: number;
   seamSquarenessOverrides: (number | null)[];
+  /**
+   * Per-seam cubic endpoint style (bulge mode). If shorter than `nSeams`, missing entries default
+   * from `seamSquareness` / overrides / sixPanelSeams.
+   */
+  seamEndpointStyles: SeamEndpointStyle[];
+  /**
+   * Optional resolved arc length per seam (m). When set (e.g. by measurement solver), cubic seams
+   * scale handles with λ to match this length.
+   */
+  seamTargetArcLengthM: (number | null)[];
   /** 6-panel: optional grouped bulge per seam region. */
   sixPanelSeams: SixPanelSeamSquareness | null;
   /** 5-panel: split front edge curves (seams 0 and 1). Set to null to use a single bulge per seam. */
@@ -132,6 +163,10 @@ export interface HatSkeletonSpec {
     blend: number;
     baseLengthM: number;
     topLengthM: number;
+    /** Quadratic bulge on rim → V leg (angles fixed by the V). Omitted → 0. */
+    legBottomStrength?: number;
+    /** Quadratic bulge on V → top leg. Omitted → 0. */
+    legTopStrength?: number;
   } | null;
   /**
    * When true, subtract a fixed rectangular opening (3" × 2.75") at the rear center seam on the crown mesh.
@@ -158,13 +193,15 @@ export const defaultHatSkeletonSpec = (): HatSkeletonSpec => ({
   yawRad: 0,
   nSeams: 6,
   seamAnglesRad: null,
-  crownHeight: 0.12,
+  crownHeight: 0.11,
   topRimFraction: 0,
   seamCurveMode: "squareness",
   seamArcLengthMultiplier: 1.12,
   seamSuperellipseN: 3,
   seamSquareness: 0.35,
   seamSquarenessOverrides: [],
+  seamEndpointStyles: [],
+  seamTargetArcLengthM: [],
   sixPanelSeams: null,
   fivePanelFrontSeams: { visor: 0.35, crown: 0.35, splitT: 0.45 },
   fivePanelCenterSeamLength: 0.36,
@@ -190,6 +227,8 @@ export function mergeHatSpecDefaults(spec: HatSkeletonSpec): HatSkeletonSpec {
     seamSuperellipseN: spec.seamSuperellipseN ?? d.seamSuperellipseN,
     topRimFraction,
     backClosureOpening: spec.backClosureOpening ?? d.backClosureOpening,
+    seamEndpointStyles: spec.seamEndpointStyles ?? d.seamEndpointStyles,
+    seamTargetArcLengthM: spec.seamTargetArcLengthM ?? d.seamTargetArcLengthM,
     visor: { ...d.visor, ...spec.visor },
   };
 }
@@ -204,6 +243,14 @@ export function validateSpec(spec: HatSkeletonSpec): void {
   const o = spec.seamSquarenessOverrides;
   if (o.length > 0 && o.length !== spec.nSeams) {
     throw new Error("seamSquarenessOverrides length must match nSeams");
+  }
+  const eps = spec.seamEndpointStyles;
+  if (eps.length > 0 && eps.length !== spec.nSeams) {
+    throw new Error("seamEndpointStyles length must match nSeams or be empty");
+  }
+  const st = spec.seamTargetArcLengthM;
+  if (st.length > 0 && st.length !== spec.nSeams) {
+    throw new Error("seamTargetArcLengthM length must match nSeams or be empty");
   }
   if (spec.visor.rimInsetBehindSeamRad < 0) {
     throw new Error("rimInsetBehindSeamRad must be >= 0");

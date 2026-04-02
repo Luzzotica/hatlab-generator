@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import { buildHatGroup } from "@/lib/hat/buildHatGroup";
 import {
@@ -8,7 +8,7 @@ import {
   disposeMeasurementHighlightGroup,
   type MeasurementFieldHighlight,
 } from "@/lib/hat/measurementHighlight";
-import { buildSkeleton, type HatSkeletonSpec } from "@/lib/skeleton";
+import { buildSkeleton, type BuiltSkeleton, type HatSkeletonSpec } from "@/lib/skeleton";
 
 function disposeObject3D(root: THREE.Object3D): void {
   root.traverse((obj) => {
@@ -32,7 +32,12 @@ export function HatModel({
   spec: HatSkeletonSpec;
   measurementHighlight?: MeasurementFieldHighlight | null;
 }) {
-  const sk = useMemo(() => buildSkeleton(spec), [spec]);
+  const prevSkRef = useRef<BuiltSkeleton | null>(null);
+  const sk = useMemo(() => {
+    const next = buildSkeleton(spec, prevSkRef.current);
+    prevSkRef.current = next;
+    return next;
+  }, [spec]);
   const hatGroup = useMemo(() => buildHatGroup(sk), [sk]);
   const highlightGroup = useMemo(
     () => buildMeasurementHighlightGroup(sk, measurementHighlight ?? null),

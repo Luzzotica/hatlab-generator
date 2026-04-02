@@ -25,8 +25,8 @@ const SEAM_TAPE_INWARD_OFFSET_M = 0.0016;
 /** Offset along −n from opening plane for arch tape (kept in step with seam tape). */
 const ARCH_TAPE_INWARD_ALONG_N_M = 0.00165;
 
-/** Extra pull at the rim (sweatband) anchor: inward in XY toward the crown axis. */
-const SEAM_TAPE_ANCHOR_BASE_INWARD_M = 0.0005;
+/** Extra pull at the rim (sweatband) anchor: inward in XY toward the crown axis (0 = no skew vs seam). */
+const SEAM_TAPE_ANCHOR_BASE_INWARD_M = 0;
 
 /** Move the crown end of the tape slightly down along the seam (toward the rim). */
 const SEAM_TAPE_ANCHOR_TOP_ALONG_SEAM_M = 0.0005;

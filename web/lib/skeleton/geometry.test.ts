@@ -20,7 +20,15 @@ import {
   buildSkeleton,
   evalVToArcGuideMeridianAt,
   sampleVToArcGuideMeridian,
+  defaultSeamEndpointStyleFromSquareness,
+  solveLambdaForSeamCubicArcLength,
+  cubicBezierArcLength,
+  buildSeamCubicWithLambda,
+  buildSeamCubicControlPoints,
+  evalCubicBezier,
 } from "./geometry";
+import { measurementTargetsFromSpec, seamGroupIndices } from "./measurements";
+import { solveHatSpecFromMeasurements } from "./solveMeasurements";
 import { defaultHatSkeletonSpec, defaultVisorSpec, mergeHatSpecDefaults } from "./types";
 
 describe("topRimPoint", () => {
@@ -227,6 +235,8 @@ describe("sampleVToArcGuideMeridian", () => {
         blend: 0.85,
         baseLengthM: 0.07,
         topLengthM: 0.06,
+        legBottomStrength: 0,
+        legTopStrength: 0,
       },
     });
   }
@@ -356,5 +366,92 @@ describe("solveSquarenessForArcLengthMultiplier", () => {
     const s = solveSquarenessForArcLengthMultiplier(rim, top, mult);
     const L = arcLengthOfSeamQuadratic(rim, top, s);
     expect(L).toBeCloseTo(target, 2);
+  });
+});
+
+describe("seam cubic λ-solve", () => {
+  it("achieves target arc length for sample endpoints", () => {
+    const rim: [number, number, number] = [0.1, 0, 0];
+    const top: [number, number, number] = [0, 0, 0.12];
+    const style = defaultSeamEndpointStyleFromSquareness(0.35);
+    const target = 0.19;
+    const lam = solveLambdaForSeamCubicArcLength(rim, top, style, target);
+    const [p0, p1, p2, p3] = buildSeamCubicWithLambda(rim, top, style, lam);
+    const L = cubicBezierArcLength(p0, p1, p2, p3);
+    expect(L).toBeCloseTo(target, 2);
+  });
+
+  it("buildSeamCubicControlPoints keeps radial bulge ≥ chord (no inward sag vs straight rim→top)", () => {
+    const rim: [number, number, number] = [0, 0.11, 0];
+    const top: [number, number, number] = [0, 0, 0.12];
+    const style = defaultSeamEndpointStyleFromSquareness(0.35);
+    const target = arcLengthOfSeamQuadratic(rim, top, 0.35);
+    const [p0, p1, p2, p3] = buildSeamCubicControlPoints(rim, top, style, target);
+    for (let s = 1; s < 20; s++) {
+      const t = s / 20;
+      const p = evalCubicBezier(p0, p1, p2, p3, t);
+      const q: [number, number, number] = [
+        rim[0] + t * (top[0] - rim[0]),
+        rim[1] + t * (top[1] - rim[1]),
+        rim[2] + t * (top[2] - rim[2]),
+      ];
+      const rp = Math.hypot(p[0], p[1]);
+      const rq = Math.hypot(q[0], q[1]);
+      if (rq > 1e-4) {
+        expect(rp).toBeGreaterThanOrEqual(rq - 1e-5);
+      }
+    }
+  });
+});
+
+describe("buildSkeleton cubic seams", () => {
+  it("uses cubic seam controls in squareness mode", () => {
+    const spec = mergeHatSpecDefaults(defaultHatSkeletonSpec());
+    const sk = buildSkeleton(spec);
+    expect(sk.seamControls[0]?.kind).toBe("cubic");
+  });
+
+  it("reuses cubic seam controls when only another seam's target length changes", () => {
+    const base0 = mergeHatSpecDefaults(defaultHatSkeletonSpec());
+    const mt = measurementTargetsFromSpec(base0);
+    const base = mergeHatSpecDefaults(solveHatSpecFromMeasurements(base0, mt));
+    const g = seamGroupIndices(6);
+    const rearIdx = g.rear[0]!;
+    const sideFrontIdx = g.sideFront[0]!;
+    const arr = [...base.seamTargetArcLengthM];
+    arr[sideFrontIdx] = (arr[sideFrontIdx] ?? 0.1) + 0.02;
+    const spec2 = mergeHatSpecDefaults({ ...base, seamTargetArcLengthM: arr });
+    const sk0 = buildSkeleton(base);
+    const sk1 = buildSkeleton(spec2, sk0);
+    expect(sk1.seamControls[rearIdx]).toBe(sk0.seamControls[rearIdx]);
+    expect(sk1.seamControls[sideFrontIdx]).not.toBe(sk0.seamControls[sideFrontIdx]);
+  });
+
+  it("mirror seam pairs (6-panel 0↔2, 3↔5) have identical Z along the curve at apex top", () => {
+    const spec = mergeHatSpecDefaults(defaultHatSkeletonSpec());
+    expect(spec.topRimFraction).toBe(0);
+    const sk = buildSkeleton(spec);
+    const pairs: [number, number][] = [
+      [0, 2],
+      [3, 5],
+    ];
+    for (const [a, b] of pairs) {
+      const ca = sk.seamControls[a]!;
+      const cb = sk.seamControls[b]!;
+      for (let s = 0; s <= 20; s++) {
+        const t = s / 20;
+        const za = evalSeamCurve(ca, t)[2];
+        const zb = evalSeamCurve(cb, t)[2];
+        expect(za).toBeCloseTo(zb, 7);
+      }
+    }
+  });
+});
+
+describe("seamGroupIndices mirror pairs", () => {
+  it("6-panel side-front lists 0 and 2", () => {
+    const g = seamGroupIndices(6);
+    expect(g.sideFront).toEqual([0, 2]);
+    expect(g.sideBack).toEqual([3, 5]);
   });
 });

@@ -194,6 +194,12 @@ export function seamGroupLengthsFromSpec(spec: HatSkeletonSpec): {
   };
 }
 
+/** Metres, 4 decimals — keeps measurement inputs readable without float noise. */
+function roundM(x: number, decimals = 4): number {
+  const p = 10 ** decimals;
+  return Math.round(x * p) / p;
+}
+
 /** Forward-compute targets from a resolved spec (for UI defaults / round-trip). */
 export function measurementTargetsFromSpec(
   spec: HatSkeletonSpec
@@ -201,21 +207,18 @@ export function measurementTargetsFromSpec(
   const cg = seamGroupLengthsFromSpec(spec);
   const frontLen = cg.front;
   return {
-    baseCircumferenceM: sweatbandCircumference(
-      spec.semiAxisX,
-      spec.semiAxisY,
-      spec.yawRad,
-      512
+    baseCircumferenceM: roundM(
+      sweatbandCircumference(spec.semiAxisX, spec.semiAxisY, spec.yawRad, 512)
     ),
-    visorLengthM: visorLengthFromSpec(spec),
-    visorWidthM: visorSpanFromSpec(spec),
+    visorLengthM: roundM(visorLengthFromSpec(spec)),
+    visorWidthM: roundM(visorSpanFromSpec(spec)),
     frontSeamMode: "curve",
-    seamEdgeLengthFrontM: frontLen,
-    seamFrontBaseLengthM: frontLen * 0.5,
-    seamFrontTopLengthM: frontLen * 0.5,
+    seamEdgeLengthFrontM: roundM(frontLen),
+    seamFrontBaseLengthM: roundM(frontLen * 0.5),
+    seamFrontTopLengthM: roundM(frontLen * 0.5),
     frontSplitBlend: 1.0,
-    seamEdgeLengthSideFrontM: cg.sideFront,
-    seamEdgeLengthSideBackM: cg.sideBack,
-    seamEdgeLengthRearM: cg.rear,
+    seamEdgeLengthSideFrontM: roundM(cg.sideFront),
+    seamEdgeLengthSideBackM: roundM(cg.sideBack),
+    seamEdgeLengthRearM: roundM(cg.rear),
   };
 }

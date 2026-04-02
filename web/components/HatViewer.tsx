@@ -1,7 +1,14 @@
 "use client";
 
 import type { CSSProperties } from "react";
-import { Suspense, useCallback, useEffect, useRef, useState } from "react";
+import {
+  Suspense,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import * as THREE from "three";
 import { Canvas } from "@react-three/fiber";
 import { OrbitControls, PerspectiveCamera } from "@react-three/drei";
@@ -12,16 +19,40 @@ import {
   type FrontSeamMode,
   type HatMeasurementTargets,
   type HatSkeletonSpec,
+  type SeamEndpointStyle,
   validateSpec,
 } from "@/lib/skeleton/types";
 import {
   measurementTargetsFromSpec,
-  solveHatSpecFromMeasurements,
+  seamGroupIndices,
+  shouldSkipMeasurementSolve,
+  solveHatSpecFromMeasurementsIncremental,
   visorSpanRange,
 } from "@/lib/skeleton";
+import { resolveSeamEndpointStyleForIndex } from "@/lib/skeleton/geometry";
 import { buildHatGroupFromSpec } from "@/lib/hat/buildHatGroup";
 import type { MeasurementFieldHighlight } from "@/lib/hat/measurementHighlight";
 import { exportObjectToGLB, downloadBlob } from "@/lib/export/gltf";
+
+type SeamGroupKey = "front" | "sideFront" | "sideBack" | "rear";
+
+function patchGroupEndpointStyle(
+  spec: HatSkeletonSpec,
+  groupKey: SeamGroupKey,
+  patch: Partial<SeamEndpointStyle>
+): HatSkeletonSpec {
+  const indices = seamGroupIndices(spec.nSeams)[groupKey];
+  if (indices.length === 0) return spec;
+  const n = spec.nSeams;
+  const styles: SeamEndpointStyle[] = [];
+  for (let i = 0; i < n; i++) {
+    styles.push(resolveSeamEndpointStyleForIndex(spec, i));
+  }
+  for (const i of indices) {
+    styles[i] = { ...styles[i]!, ...patch };
+  }
+  return { ...spec, seamEndpointStyles: styles };
+}
 
 function Panel({
   spec,
@@ -89,12 +120,41 @@ function Panel({
       }}
     >
       <h1 style={{ margin: "0 0 12px", fontSize: 16 }}>Hat skeleton</h1>
-      <p style={{ margin: "0 0 12px", opacity: 0.85, lineHeight: 1.4 }}>
-        Math uses +Z up / +Y forward; the scene is rotated so the hat sits
-        naturally (Y-up: brim horizontal, crown up). Drag to orbit. Export
-        matches the viewer. Crown base follows the sweatband ellipse; rings
-        step up toward the button with seam edges on the blue curves.
-      </p>
+      <div style={{ ...lab, marginBottom: 12 }}>
+        <span style={{ fontWeight: 600 }}>Panels</span>
+        <div style={{ display: "flex", gap: 8 }}>
+          {([5, 6] as const).map((n) => (
+            <button
+              key={n}
+              type="button"
+              onClick={() =>
+                set({
+                  nSeams: n,
+                  seamAnglesRad: null,
+                  seamSquarenessOverrides: [],
+                  seamEndpointStyles: [],
+                  seamTargetArcLengthM: [],
+                })
+              }
+              style={{
+                flex: 1,
+                padding: "8px 10px",
+                borderRadius: 6,
+                border:
+                  spec.nSeams === n
+                    ? "1px solid #3b82f6"
+                    : "1px solid #374151",
+                background: spec.nSeams === n ? "#1e3a5f" : "#1f2937",
+                color: "#e5e7eb",
+                cursor: "pointer",
+                fontSize: 12,
+              }}
+            >
+              {n}-panel
+            </button>
+          ))}
+        </div>
+      </div>
       <div
         ref={measurementBlockRef}
         style={{
@@ -105,8 +165,7 @@ function Panel({
       >
         <span style={{ fontWeight: 600 }}>Measurements (metres)</span>
         <p style={{ margin: "4px 0 8px", opacity: 0.65, fontSize: 11, lineHeight: 1.35 }}>
-          Changes apply instantly. Focus a field to highlight the edge
-          (green = base, amber = visor, magenta = seams).
+          Focus a field to highlight (green = base, amber = visor, magenta = seams).
         </p>
         <label style={lab}>
           Base circumference
@@ -122,184 +181,445 @@ function Panel({
             }
           />
         </label>
-        <label style={lab}>
-          Visor length (rim → edge)
-          <input
-            type="number"
-            step={0.001}
-            min={0.005}
-            value={mt.visorLengthM}
-            style={hiInput("visorLength")}
-            onFocus={() => onMeasurementHighlightChange("visorLength")}
-            onChange={(e) =>
-              setMt({ visorLengthM: Number(e.target.value) })
-            }
-          />
-        </label>
-        <label style={lab}>
-          Visor width (left → right)
-          {(() => {
-            const range = visorSpanRange(spec);
-            return (
-              <>
-                <input
-                  type="range"
-                  min={range.min}
-                  max={range.max}
-                  step={0.001}
-                  value={Math.min(Math.max(mt.visorWidthM, range.min), range.max)}
-                  style={hiInput("visorWidth")}
-                  onFocus={() => onMeasurementHighlightChange("visorWidth")}
-                  onChange={(e) =>
-                    setMt({ visorWidthM: Number(e.target.value) })
-                  }
-                />
-                <span style={{ fontSize: 11, opacity: 0.75 }}>
-                  {mt.visorWidthM.toFixed(3)} m
-                  <span style={{ opacity: 0.5, marginLeft: 6 }}>
-                    ({range.min.toFixed(3)} – {range.max.toFixed(3)})
-                  </span>
-                </span>
-              </>
-            );
-          })()}
-        </label>
 
-        {/* Front seam */}
-        <div style={{ marginBottom: 6, marginTop: 4 }}>
-          <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
-            {(["curve", "split"] as FrontSeamMode[]).map((m) => (
-              <button
-                key={m}
-                type="button"
-                onClick={() => setMt({ frontSeamMode: m })}
-                style={{
-                  flex: 1,
-                  padding: "5px 8px",
-                  borderRadius: 5,
-                  border: mt.frontSeamMode === m ? "1px solid #3b82f6" : "1px solid #374151",
-                  background: mt.frontSeamMode === m ? "#1e3a5f" : "#1f2937",
-                  color: "#e5e7eb",
-                  cursor: "pointer",
-                  fontSize: 11,
-                }}
-              >
-                {m === "curve" ? "Front: single curve" : "Front: base + top"}
-              </button>
-            ))}
-          </div>
-          {mt.frontSeamMode === "split" ? (
-            <>
-              <label style={lab}>
-                Front base → V-point
-                <input
-                  type="number"
-                  step={0.001}
-                  min={0.01}
-                  value={mt.seamFrontBaseLengthM}
-                  style={hiInput("seamFront")}
-                  onFocus={() => onMeasurementHighlightChange("seamFront")}
-                  onChange={(e) =>
-                    setMt({ seamFrontBaseLengthM: Number(e.target.value) })
-                  }
-                />
-              </label>
-              <label style={lab}>
-                Front V-point → top
-                <input
-                  type="number"
-                  step={0.001}
-                  min={0.01}
-                  value={mt.seamFrontTopLengthM}
-                  style={hiInput("seamFront")}
-                  onFocus={() => onMeasurementHighlightChange("seamFront")}
-                  onChange={(e) =>
-                    setMt({ seamFrontTopLengthM: Number(e.target.value) })
-                  }
-                />
-              </label>
-              <label style={lab}>
-                V-shape strength
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.01}
-                  value={mt.frontSplitBlend}
-                  onChange={(e) =>
-                    setMt({ frontSplitBlend: Number(e.target.value) })
-                  }
-                />
-                <span style={{ fontSize: 11, opacity: 0.75 }}>
-                  {mt.frontSplitBlend.toFixed(2)}
-                  <span style={{ opacity: 0.5, marginLeft: 6 }}>
-                    (0 = smooth curve, 1 = sharp V)
-                  </span>
-                </span>
-              </label>
-            </>
-          ) : (
-            <label style={lab}>
-              Front seam arc
-              <input
-                type="number"
-                step={0.001}
-                min={0.02}
-                value={mt.seamEdgeLengthFrontM}
-                style={hiInput("seamFront")}
-                onFocus={() => onMeasurementHighlightChange("seamFront")}
-                onChange={(e) =>
-                  setMt({ seamEdgeLengthFrontM: Number(e.target.value) })
-                }
-              />
-            </label>
-          )}
-        </div>
-
-        <label style={lab}>
-          Side-front seam arc
-          <input
-            type="number"
-            step={0.001}
-            min={0.02}
-            value={mt.seamEdgeLengthSideFrontM}
-            style={hiInput("seamSideFront")}
-            onFocus={() => onMeasurementHighlightChange("seamSideFront")}
-            onChange={(e) =>
-              setMt({ seamEdgeLengthSideFrontM: Number(e.target.value) })
-            }
-          />
-        </label>
-        {spec.nSeams === 6 && (
+        <div
+          style={{
+            ...lab,
+            borderTop: "1px solid #374151",
+            paddingTop: 10,
+            marginTop: 10,
+          }}
+        >
+          <span style={{ fontWeight: 600 }}>Visor</span>
           <label style={lab}>
-            Side-back seam arc
+            Length (rim → edge, solver)
             <input
               type="number"
               step={0.001}
-              min={0.02}
-              value={mt.seamEdgeLengthSideBackM}
-              style={hiInput("seamSideBack")}
-              onFocus={() => onMeasurementHighlightChange("seamSideBack")}
+              min={0.005}
+              value={mt.visorLengthM}
+              style={hiInput("visorLength")}
+              onFocus={() => onMeasurementHighlightChange("visorLength")}
               onChange={(e) =>
-                setMt({ seamEdgeLengthSideBackM: Number(e.target.value) })
+                setMt({ visorLengthM: Number(e.target.value) })
               }
             />
           </label>
-        )}
-        <label style={lab}>
-          Rear seam arc
-          <input
-            type="number"
-            step={0.001}
-            min={0.02}
-            value={mt.seamEdgeLengthRearM}
-            style={hiInput("seamRear")}
-            onFocus={() => onMeasurementHighlightChange("seamRear")}
-            onChange={(e) =>
-              setMt({ seamEdgeLengthRearM: Number(e.target.value) })
-            }
-          />
-        </label>
+          <label style={lab}>
+            Width (left → right, solver)
+            {(() => {
+              const range = visorSpanRange(spec);
+              return (
+                <>
+                  <input
+                    type="range"
+                    min={range.min}
+                    max={range.max}
+                    step={0.001}
+                    value={Math.min(Math.max(mt.visorWidthM, range.min), range.max)}
+                    style={hiInput("visorWidth")}
+                    onFocus={() => onMeasurementHighlightChange("visorWidth")}
+                    onChange={(e) =>
+                      setMt({ visorWidthM: Number(e.target.value) })
+                    }
+                  />
+                  <span style={{ fontSize: 11, opacity: 0.75 }}>
+                    {mt.visorWidthM.toFixed(3)} m
+                    <span style={{ opacity: 0.5, marginLeft: 6 }}>
+                      ({range.min.toFixed(3)} – {range.max.toFixed(3)})
+                    </span>
+                  </span>
+                </>
+              );
+            })()}
+          </label>
+          <label style={lab}>
+            Projection
+            <input
+              type="range"
+              min={0.05}
+              max={0.25}
+              step={0.005}
+              value={v.projection}
+              onChange={(e) => setVisor({ projection: Number(e.target.value) })}
+            />
+            <span>{v.projection.toFixed(3)}</span>
+          </label>
+          <label style={lab}>
+            Half-span (max, rad)
+            <input
+              type="range"
+              min={0.2}
+              max={1.35}
+              step={0.005}
+              value={v.halfSpanRad}
+              onChange={(e) => setVisor({ halfSpanRad: Number(e.target.value) })}
+            />
+            <span>{v.halfSpanRad.toFixed(3)}</span>
+          </label>
+          <label style={lab}>
+            Rim past side seams (outset, rad)
+            <input
+              type="range"
+              min={0}
+              max={0.12}
+              step={0.005}
+              value={v.rimOutsetBeyondSeamRad ?? 0.035}
+              onChange={(e) =>
+                setVisor({ rimOutsetBeyondSeamRad: Number(e.target.value) })
+              }
+            />
+            <span>{(v.rimOutsetBeyondSeamRad ?? 0.035).toFixed(3)}</span>
+          </label>
+          <label style={lab}>
+            Inset from side seams (narrow, rad)
+            <input
+              type="range"
+              min={0}
+              max={0.2}
+              step={0.005}
+              value={v.rimInsetBehindSeamRad}
+              onChange={(e) =>
+                setVisor({ rimInsetBehindSeamRad: Number(e.target.value) })
+              }
+            />
+            <span>{v.rimInsetBehindSeamRad.toFixed(3)}</span>
+          </label>
+          <label style={lab}>
+            Outline curve (<em>n</em>, superellipse)
+            <input
+              type="range"
+              min={1.05}
+              max={6}
+              step={0.05}
+              value={v.superellipseN}
+              onChange={(e) =>
+                setVisor({ superellipseN: Number(e.target.value), mode: "superellipse" })
+              }
+            />
+            <span>{v.superellipseN.toFixed(2)}</span>
+          </label>
+        </div>
+
+        <div
+          style={{
+            ...lab,
+            borderTop: "1px solid #374151",
+            paddingTop: 10,
+            marginTop: 10,
+          }}
+        >
+          <span style={{ fontWeight: 600 }}>Seams (per region)</span>
+          {(spec.nSeams === 6
+            ? (["front", "sideFront", "sideBack", "rear"] as const)
+            : (["front", "sideFront", "rear"] as const)
+          ).map((key) => {
+            const g = seamGroupIndices(spec.nSeams)[key];
+            if (g.length === 0) return null;
+            const idx = g[0]!;
+            const st = resolveSeamEndpointStyleForIndex(spec, idx);
+            const title =
+              key === "front"
+                ? spec.nSeams === 6
+                  ? "Front center"
+                  : "Front (center)"
+                : key === "sideFront"
+                  ? "Side-front (mirrored pair)"
+                  : key === "sideBack"
+                    ? "Side-back (mirrored pair)"
+                    : "Rear center";
+            return (
+              <div
+                key={key}
+                style={{
+                  marginBottom: 12,
+                  paddingBottom: 10,
+                  borderBottom: "1px solid #2d3748",
+                }}
+              >
+                <span style={{ fontSize: 12, opacity: 0.95 }}>{title}</span>
+
+                {key === "front" && (
+                  <div style={{ marginBottom: 8, marginTop: 6 }}>
+                    <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+                      {(["curve", "split"] as FrontSeamMode[]).map((m) => (
+                        <button
+                          key={m}
+                          type="button"
+                          onClick={() => setMt({ frontSeamMode: m })}
+                          style={{
+                            flex: 1,
+                            padding: "5px 8px",
+                            borderRadius: 5,
+                            border:
+                              mt.frontSeamMode === m
+                                ? "1px solid #3b82f6"
+                                : "1px solid #374151",
+                            background: mt.frontSeamMode === m ? "#1e3a5f" : "#1f2937",
+                            color: "#e5e7eb",
+                            cursor: "pointer",
+                            fontSize: 11,
+                          }}
+                        >
+                          {m === "curve" ? "Single curve" : "Base + top (V)"}
+                        </button>
+                      ))}
+                    </div>
+                    {mt.frontSeamMode === "split" ? (
+                      <>
+                        <label style={lab}>
+                          Front base → V-point
+                          <input
+                            type="number"
+                            step={0.001}
+                            min={0.01}
+                            value={mt.seamFrontBaseLengthM}
+                            style={hiInput("seamFront")}
+                            onFocus={() => onMeasurementHighlightChange("seamFront")}
+                            onChange={(e) =>
+                              setMt({ seamFrontBaseLengthM: Number(e.target.value) })
+                            }
+                          />
+                        </label>
+                        <label style={lab}>
+                          Front V-point → top
+                          <input
+                            type="number"
+                            step={0.001}
+                            min={0.01}
+                            value={mt.seamFrontTopLengthM}
+                            style={hiInput("seamFront")}
+                            onFocus={() => onMeasurementHighlightChange("seamFront")}
+                            onChange={(e) =>
+                              setMt({ seamFrontTopLengthM: Number(e.target.value) })
+                            }
+                          />
+                        </label>
+                        <label style={lab}>
+                          V-shape strength
+                          <input
+                            type="range"
+                            min={0}
+                            max={1}
+                            step={0.01}
+                            value={mt.frontSplitBlend}
+                            onChange={(e) =>
+                              setMt({ frontSplitBlend: Number(e.target.value) })
+                            }
+                          />
+                          <span style={{ fontSize: 11, opacity: 0.75 }}>
+                            {mt.frontSplitBlend.toFixed(2)}
+                            <span style={{ opacity: 0.5, marginLeft: 6 }}>
+                              (0 = smooth curve, 1 = sharp V)
+                            </span>
+                          </span>
+                        </label>
+                        {spec.frontVSplit && (
+                          <>
+                            <label style={lab}>
+                              V leg bulge (rim → V)
+                              <input
+                                type="range"
+                                min={0}
+                                max={0.5}
+                                step={0.01}
+                                value={spec.frontVSplit.legBottomStrength ?? 0}
+                                onChange={(e) =>
+                                  set({
+                                    frontVSplit: {
+                                      ...spec.frontVSplit!,
+                                      legBottomStrength: Number(e.target.value),
+                                    },
+                                  })
+                                }
+                              />
+                              <span>{(spec.frontVSplit.legBottomStrength ?? 0).toFixed(2)}</span>
+                            </label>
+                            <label style={lab}>
+                              V leg bulge (V → top)
+                              <input
+                                type="range"
+                                min={0}
+                                max={0.5}
+                                step={0.01}
+                                value={spec.frontVSplit.legTopStrength ?? 0}
+                                onChange={(e) =>
+                                  set({
+                                    frontVSplit: {
+                                      ...spec.frontVSplit!,
+                                      legTopStrength: Number(e.target.value),
+                                    },
+                                  })
+                                }
+                              />
+                              <span>{(spec.frontVSplit.legTopStrength ?? 0).toFixed(2)}</span>
+                            </label>
+                          </>
+                        )}
+                      </>
+                    ) : (
+                      <label style={lab}>
+                        Target arc length (rim → top)
+                        <input
+                          type="number"
+                          step={0.001}
+                          min={0.02}
+                          value={mt.seamEdgeLengthFrontM}
+                          style={hiInput("seamFront")}
+                          onFocus={() => onMeasurementHighlightChange("seamFront")}
+                          onChange={(e) =>
+                            setMt({ seamEdgeLengthFrontM: Number(e.target.value) })
+                          }
+                        />
+                      </label>
+                    )}
+                  </div>
+                )}
+
+                {key === "sideFront" && (
+                  <label style={lab}>
+                    Target arc length (rim → top)
+                    <input
+                      type="number"
+                      step={0.001}
+                      min={0.02}
+                      value={mt.seamEdgeLengthSideFrontM}
+                      style={hiInput("seamSideFront")}
+                      onFocus={() => onMeasurementHighlightChange("seamSideFront")}
+                      onChange={(e) =>
+                        setMt({ seamEdgeLengthSideFrontM: Number(e.target.value) })
+                      }
+                    />
+                  </label>
+                )}
+                {key === "sideBack" && spec.nSeams === 6 && (
+                  <label style={lab}>
+                    Target arc length (rim → top)
+                    <input
+                      type="number"
+                      step={0.001}
+                      min={0.02}
+                      value={mt.seamEdgeLengthSideBackM}
+                      style={hiInput("seamSideBack")}
+                      onFocus={() => onMeasurementHighlightChange("seamSideBack")}
+                      onChange={(e) =>
+                        setMt({ seamEdgeLengthSideBackM: Number(e.target.value) })
+                      }
+                    />
+                  </label>
+                )}
+                {key === "rear" && (
+                  <label style={lab}>
+                    Target arc length (rim → top)
+                    <input
+                      type="number"
+                      step={0.001}
+                      min={0.02}
+                      value={mt.seamEdgeLengthRearM}
+                      style={hiInput("seamRear")}
+                      onFocus={() => onMeasurementHighlightChange("seamRear")}
+                      onChange={(e) =>
+                        setMt({ seamEdgeLengthRearM: Number(e.target.value) })
+                      }
+                    />
+                  </label>
+                )}
+
+                <label style={lab}>
+                  Bottom strength
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.02}
+                    value={st.bottomStrength}
+                    onChange={(e) =>
+                      set(
+                        patchGroupEndpointStyle(spec, key, {
+                          bottomStrength: Number(e.target.value),
+                        })
+                      )
+                    }
+                  />
+                  <span>{st.bottomStrength.toFixed(2)}</span>
+                </label>
+                <label style={lab}>
+                  Bottom angle (deg,{" "}
+                  {st.lockAnglesToSeamPlane
+                    ? "0 = straight up at rim, 90 = outward in plane"
+                    : "0 = along rim→top chord, 90 = outward in plane"}
+                  <input
+                    type="range"
+                    min={-90}
+                    max={90}
+                    step={1}
+                    value={(st.bottomAngleRad * 180) / Math.PI}
+                    onChange={(e) =>
+                      set(
+                        patchGroupEndpointStyle(spec, key, {
+                          bottomAngleRad: (Number(e.target.value) * Math.PI) / 180,
+                        })
+                      )
+                    }
+                  />
+                  <span>{((st.bottomAngleRad * 180) / Math.PI).toFixed(0)}°</span>
+                </label>
+                <label style={lab}>
+                  Top strength
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.02}
+                    value={st.topStrength}
+                    onChange={(e) =>
+                      set(
+                        patchGroupEndpointStyle(spec, key, {
+                          topStrength: Number(e.target.value),
+                        })
+                      )
+                    }
+                  />
+                  <span>{st.topStrength.toFixed(2)}</span>
+                </label>
+                <label style={{ ...lab, flexDirection: "row", alignItems: "center", gap: 8 }}>
+                  <input
+                    type="checkbox"
+                    checked={st.lockAnglesToSeamPlane}
+                    onChange={(e) =>
+                      set(
+                        patchGroupEndpointStyle(spec, key, {
+                          lockAnglesToSeamPlane: e.target.checked,
+                        })
+                      )
+                    }
+                  />
+                  <span>Lock handle angles to seam plane</span>
+                </label>
+                {st.lockAnglesToSeamPlane ? null : (
+                  <label style={lab}>
+                    Top angle (deg)
+                    <input
+                      type="range"
+                      min={-90}
+                      max={90}
+                      step={1}
+                      value={(st.topAngleRad * 180) / Math.PI}
+                      onChange={(e) =>
+                        set(
+                          patchGroupEndpointStyle(spec, key, {
+                            topAngleRad: (Number(e.target.value) * Math.PI) / 180,
+                          })
+                        )
+                      }
+                    />
+                    <span>{((st.topAngleRad * 180) / Math.PI).toFixed(0)}°</span>
+                  </label>
+                )}
+              </div>
+            );
+          })}
+        </div>
       </div>
       <label style={lab}>
         Semi axis X
@@ -349,277 +669,18 @@ function Panel({
         />
         <span>{spec.topRimFraction.toFixed(3)}</span>
       </label>
-      <p style={{ margin: "-4px 0 8px", opacity: 0.65, fontSize: 11, lineHeight: 1.35 }}>
-        Seams end on a small flat ellipse at the crown (not a sharp point). 0 = cone tip.
-      </p>
-      <div style={{ ...lab, marginBottom: 12 }}>
-        <span>Panels</span>
-        <div style={{ display: "flex", gap: 8 }}>
-          {([5, 6] as const).map((n) => (
-            <button
-              key={n}
-              type="button"
-              onClick={() =>
-                set({
-                  nSeams: n,
-                  seamAnglesRad: null,
-                  seamSquarenessOverrides: [],
-                })
-              }
-              style={{
-                flex: 1,
-                padding: "8px 10px",
-                borderRadius: 6,
-                border:
-                  spec.nSeams === n
-                    ? "1px solid #3b82f6"
-                    : "1px solid #374151",
-                background: spec.nSeams === n ? "#1e3a5f" : "#1f2937",
-                color: "#e5e7eb",
-                cursor: "pointer",
-                fontSize: 12,
-              }}
-            >
-              {n}-panel
-            </button>
-          ))}
-        </div>
-        <p style={{ margin: "6px 0 0", opacity: 0.7, fontSize: 11, lineHeight: 1.35 }}>
-          5-panel: front <strong>panel</strong> faces the visor. 6-panel: front{" "}
-          <strong>seam</strong> splits the visor.
-        </p>
-      </div>
-      <div style={{ ...lab, marginBottom: 8 }}>
-        <span style={{ fontWeight: 600 }}>Seam curve (blue lines)</span>
-        <p style={{ margin: "4px 0 8px", opacity: 0.75, fontSize: 11, lineHeight: 1.35 }}>
-          <strong>Bulge</strong> uses a quadratic seam. <strong>Arc length</strong> sets length vs
-          chord on that family. <strong>Superellipse</strong> uses the same profile as the visor
-          (curvedness via exponent <em>n</em>) in each seam plane.
-        </p>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          {(["squareness", "arcLength", "superellipse"] as const).map((mode) => (
-            <button
-              key={mode}
-              type="button"
-              onClick={() => set({ seamCurveMode: mode })}
-              style={{
-                flex: 1,
-                minWidth: 88,
-                padding: "8px 10px",
-                borderRadius: 6,
-                border:
-                  spec.seamCurveMode === mode
-                    ? "1px solid #3b82f6"
-                    : "1px solid #374151",
-                background: spec.seamCurveMode === mode ? "#1e3a5f" : "#1f2937",
-                color: "#e5e7eb",
-                cursor: "pointer",
-                fontSize: 12,
-              }}
-            >
-              {mode === "squareness"
-                ? "Bulge"
-                : mode === "arcLength"
-                  ? "Arc length"
-                  : "Superellipse"}
-            </button>
-          ))}
-        </div>
-      </div>
-      {spec.seamCurveMode === "arcLength" ? (
-        <label style={lab}>
-          Seam length (× chord)
-          <input
-            type="range"
-            min={1}
-            max={2.5}
-            step={0.01}
-            value={spec.seamArcLengthMultiplier}
-            onChange={(e) =>
-              set({ seamArcLengthMultiplier: Number(e.target.value) })
-            }
-          />
-          <span>{spec.seamArcLengthMultiplier.toFixed(2)}×</span>
-        </label>
-      ) : spec.seamCurveMode === "superellipse" ? (
-        <>
-          <label style={lab}>
-            Base seam bulge
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.05}
-              value={spec.seamSquareness}
-              onChange={(e) => set({ seamSquareness: Number(e.target.value) })}
-            />
-            <span>{spec.seamSquareness.toFixed(2)}</span>
-          </label>
-          <label style={lab}>
-            Seam superellipse <em>n</em> (like visor)
-            <input
-              type="range"
-              min={2}
-              max={10}
-              step={0.05}
-              value={spec.seamSuperellipseN ?? 3}
-              onChange={(e) =>
-                set({ seamSuperellipseN: Number(e.target.value) })
-              }
-            />
-            <span>{(spec.seamSuperellipseN ?? 3).toFixed(2)}</span>
-          </label>
-        </>
-      ) : (
-        <label style={lab}>
-          Base seam bulge
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.05}
-            value={spec.seamSquareness}
-            onChange={(e) => set({ seamSquareness: Number(e.target.value) })}
-          />
-          <span>{spec.seamSquareness.toFixed(2)}</span>
-        </label>
-      )}
-      {spec.seamCurveMode === "arcLength" && (
-        <p style={{ margin: "-4px 0 12px", opacity: 0.65, fontSize: 11, lineHeight: 1.35 }}>
-          1× = straight. Split front seams and grouped 6-panel bulge are not used in this mode.
-        </p>
-      )}
-      {spec.seamCurveMode === "superellipse" && (
-        <p style={{ margin: "-4px 0 12px", opacity: 0.65, fontSize: 11, lineHeight: 1.35 }}>
-          2 ≈ circular arc, higher <em>n</em> (e.g. 3) = squircle-like. Split front seams are not
-          used.
-        </p>
-      )}
-      {spec.nSeams === 6 && (
-        <div
-          style={{
-            ...lab,
-            borderTop: "1px solid #374151",
-            paddingTop: 10,
-            opacity:
-              spec.seamCurveMode === "arcLength" ? 0.5 : 1,
-          }}
-        >
-          <span style={{ fontWeight: 600 }}>6-panel seam bulge</span>
-          <p style={{ margin: "4px 0 8px", opacity: 0.75, fontSize: 11, lineHeight: 1.35 }}>
-            Front = center ridge (+Y). Side-front = seams next to it. Back = the other three.
-            Leave “use groups” off to use base bulge only.
-          </p>
-          <label style={{ ...lab, flexDirection: "row", alignItems: "center", gap: 8 }}>
-            <input
-              type="checkbox"
-              disabled={spec.seamCurveMode === "arcLength"}
-              checked={spec.sixPanelSeams !== null}
-              onChange={(e) =>
-                set({
-                  sixPanelSeams: e.target.checked
-                    ? {
-                        front: spec.seamSquareness,
-                        sideFront: spec.seamSquareness,
-                        back: spec.seamSquareness,
-                      }
-                    : null,
-                })
-              }
-            />
-            <span>Use grouped bulge</span>
-          </label>
-          {spec.sixPanelSeams !== null && (
-            <>
-              <label style={lab}>
-                Front seam (center)
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  disabled={spec.seamCurveMode === "arcLength"}
-                  value={spec.sixPanelSeams.front}
-                  onChange={(e) =>
-                    set({
-                      sixPanelSeams: {
-                        ...spec.sixPanelSeams!,
-                        front: Number(e.target.value),
-                      },
-                    })
-                  }
-                />
-                <span>{spec.sixPanelSeams.front.toFixed(2)}</span>
-              </label>
-              <label style={lab}>
-                Side-front (left &amp; right of center)
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  disabled={spec.seamCurveMode === "arcLength"}
-                  value={spec.sixPanelSeams.sideFront}
-                  onChange={(e) =>
-                    set({
-                      sixPanelSeams: {
-                        ...spec.sixPanelSeams!,
-                        sideFront: Number(e.target.value),
-                      },
-                    })
-                  }
-                />
-                <span>{spec.sixPanelSeams.sideFront.toFixed(2)}</span>
-              </label>
-              <label style={lab}>
-                Back seams (three)
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  disabled={spec.seamCurveMode === "arcLength"}
-                  value={spec.sixPanelSeams.back}
-                  onChange={(e) =>
-                    set({
-                      sixPanelSeams: {
-                        ...spec.sixPanelSeams!,
-                        back: Number(e.target.value),
-                      },
-                    })
-                  }
-                />
-                <span>{spec.sixPanelSeams.back.toFixed(2)}</span>
-              </label>
-            </>
-          )}
-        </div>
-      )}
       {spec.nSeams === 5 && (
         <div
           style={{
             ...lab,
             borderTop: "1px solid #374151",
             paddingTop: 10,
-            opacity:
-              spec.seamCurveMode === "arcLength" ||
-              spec.seamCurveMode === "superellipse"
-                ? 0.5
-                : 1,
           }}
         >
           <span style={{ fontWeight: 600 }}>5-panel front edges (seams 0 &amp; 1)</span>
-          <p style={{ margin: "4px 0 8px", opacity: 0.75, fontSize: 11, lineHeight: 1.35 }}>
-            Split the front panel boundary into a lower (visor) curve and an upper (crown)
-            curve. Turn off to use one bulge per seam (base + overrides).
-          </p>
           <label style={{ ...lab, flexDirection: "row", alignItems: "center", gap: 8 }}>
             <input
               type="checkbox"
-              disabled={
-                spec.seamCurveMode === "arcLength" ||
-                spec.seamCurveMode === "superellipse"
-              }
               checked={spec.fivePanelFrontSeams !== null}
               onChange={(e) =>
                 set({
@@ -644,10 +705,6 @@ function Panel({
                   min={0}
                   max={1}
                   step={0.05}
-                  disabled={
-                    spec.seamCurveMode === "arcLength" ||
-                    spec.seamCurveMode === "superellipse"
-                  }
                   value={spec.fivePanelFrontSeams.visor}
                   onChange={(e) =>
                     set({
@@ -667,10 +724,6 @@ function Panel({
                   min={0}
                   max={1}
                   step={0.05}
-                  disabled={
-                    spec.seamCurveMode === "arcLength" ||
-                    spec.seamCurveMode === "superellipse"
-                  }
                   value={spec.fivePanelFrontSeams.crown}
                   onChange={(e) =>
                     set({
@@ -690,10 +743,6 @@ function Panel({
                   min={0.1}
                   max={0.9}
                   step={0.02}
-                  disabled={
-                    spec.seamCurveMode === "arcLength" ||
-                    spec.seamCurveMode === "superellipse"
-                  }
                   value={spec.fivePanelFrontSeams.splitT}
                   onChange={(e) =>
                     set({
@@ -710,58 +759,6 @@ function Panel({
           )}
         </div>
       )}
-      <label style={lab}>
-        Visor projection
-        <input
-          type="range"
-          min={0.05}
-          max={0.25}
-          step={0.005}
-          value={v.projection}
-          onChange={(e) => setVisor({ projection: Number(e.target.value) })}
-        />
-        <span>{v.projection.toFixed(3)}</span>
-      </label>
-      <label style={lab}>
-        Visor half-span (max, rad)
-        <input
-          type="range"
-          min={0.2}
-          max={1.35}
-          step={0.005}
-          value={v.halfSpanRad}
-          onChange={(e) => setVisor({ halfSpanRad: Number(e.target.value) })}
-        />
-        <span>{v.halfSpanRad.toFixed(3)}</span>
-      </label>
-      <label style={lab}>
-        Rim past side seams (outset, rad)
-        <input
-          type="range"
-          min={0}
-          max={0.12}
-          step={0.005}
-          value={v.rimOutsetBeyondSeamRad ?? 0.035}
-          onChange={(e) =>
-            setVisor({ rimOutsetBeyondSeamRad: Number(e.target.value) })
-          }
-        />
-        <span>{(v.rimOutsetBeyondSeamRad ?? 0.035).toFixed(3)}</span>
-      </label>
-      <label style={lab}>
-        Visor inset from side seams (narrow)
-        <input
-          type="range"
-          min={0}
-          max={0.2}
-          step={0.005}
-          value={v.rimInsetBehindSeamRad}
-          onChange={(e) =>
-            setVisor({ rimInsetBehindSeamRad: Number(e.target.value) })
-          }
-        />
-        <span>{v.rimInsetBehindSeamRad.toFixed(3)} rad</span>
-      </label>
       {spec.nSeams === 5 ? (
         <label style={lab}>
           5-panel center seam (from button)
@@ -777,11 +774,7 @@ function Panel({
           />
           <span>{spec.fivePanelCenterSeamLength.toFixed(2)}</span>
         </label>
-      ) : (
-        <p style={{ ...lab, opacity: 0.65, fontSize: 11, marginBottom: 10 }}>
-          Center seam (button → partial) applies to 5-panel only.
-        </p>
-      )}
+      ) : null}
       <div
         style={{
           ...lab,
@@ -795,27 +788,9 @@ function Panel({
             checked={spec.backClosureOpening}
             onChange={(e) => set({ backClosureOpening: e.target.checked })}
           />
-          <span>Back closure opening (3 in wide, straight sides + arc)</span>
+          <span>Back closure opening</span>
         </label>
-        <p style={{ margin: "4px 0 0", opacity: 0.7, fontSize: 11, lineHeight: 1.35 }}>
-          2.5 cm straight left/right edges, semicircle on top (3 in wide); thin cut through the
-          outer shell only.
-        </p>
       </div>
-      <label style={lab}>
-        Superellipse n
-        <input
-          type="range"
-          min={1.05}
-          max={6}
-          step={0.05}
-          value={v.superellipseN}
-          onChange={(e) =>
-            setVisor({ superellipseN: Number(e.target.value), mode: "superellipse" })
-          }
-        />
-        <span>{v.superellipseN.toFixed(2)}</span>
-      </label>
       <button
         type="button"
         onClick={onDownload}
@@ -845,6 +820,8 @@ const lab: CSSProperties = {
   fontSize: 12,
 };
 
+const MEASUREMENT_SOLVE_DEBOUNCE_MS = 120;
+
 export function HatViewer() {
   const [spec, setSpecRaw] = useState<HatSkeletonSpec>(() =>
     mergeHatSpecDefaults(defaultHatSkeletonSpec())
@@ -852,17 +829,43 @@ export function HatViewer() {
   const setSpec = useCallback((s: HatSkeletonSpec) => {
     setSpecRaw(mergeHatSpecDefaults(s));
   }, []);
+  const measurementSolveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastSolvedMeasurementTargetsRef = useRef<HatMeasurementTargets | null>(
+    measurementTargetsFromSpec(mergeHatSpecDefaults(defaultHatSkeletonSpec()))
+  );
   const [measurementTargets, setMeasurementTargetsRaw] =
     useState<HatMeasurementTargets>(() =>
       measurementTargetsFromSpec(mergeHatSpecDefaults(defaultHatSkeletonSpec()))
     );
-  const setMeasurementTargets = useCallback(
-    (mt: HatMeasurementTargets) => {
-      setMeasurementTargetsRaw(mt);
-      setSpec(solveHatSpecFromMeasurements(spec, mt));
+  const setMeasurementTargets = useCallback((mt: HatMeasurementTargets) => {
+    setMeasurementTargetsRaw(mt);
+    if (measurementSolveTimerRef.current) {
+      clearTimeout(measurementSolveTimerRef.current);
+    }
+    measurementSolveTimerRef.current = setTimeout(() => {
+      measurementSolveTimerRef.current = null;
+      const lastSolved = lastSolvedMeasurementTargetsRef.current;
+      lastSolvedMeasurementTargetsRef.current = mt;
+      setSpecRaw((prev) => {
+        if (shouldSkipMeasurementSolve(prev, lastSolved, mt)) {
+          return prev;
+        }
+        return mergeHatSpecDefaults(
+          solveHatSpecFromMeasurementsIncremental(prev, lastSolved, mt)
+        );
+      });
+    }, MEASUREMENT_SOLVE_DEBOUNCE_MS);
+  }, []);
+  useEffect(
+    () => () => {
+      if (measurementSolveTimerRef.current) {
+        clearTimeout(measurementSolveTimerRef.current);
+      }
     },
-    [spec, setSpec]
+    []
   );
+
+  const deferredSpec = useDeferredValue(spec);
   const [measurementHighlight, setMeasurementHighlight] =
     useState<MeasurementFieldHighlight>(null);
   const [exporting, setExporting] = useState(false);
@@ -940,7 +943,7 @@ export function HatViewer() {
             <ambientLight intensity={0.55} />
             <directionalLight position={[5, 8, 10]} intensity={1.1} />
             <directionalLight position={[-4, 2, -3]} intensity={0.35} />
-            <HatModel spec={spec} measurementHighlight={measurementHighlight} />
+            <HatModel spec={deferredSpec} measurementHighlight={measurementHighlight} />
             <OrbitControls makeDefault enableDamping dampingFactor={0.08} />
           </Suspense>
         </Canvas>

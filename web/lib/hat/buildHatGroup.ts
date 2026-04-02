@@ -15,6 +15,7 @@ import {
   buildCrownGeometry,
   crownArcSegments,
   crownVerticalRings,
+  ruledSurfaceVertexBetweenSeams,
 } from "@/lib/mesh/crownMesh";
 import { subtractBackClosureFromCrown } from "@/lib/mesh/backClosureSubtract";
 import { buildSweatbandGeometry } from "@/lib/mesh/sweatbandMesh";
@@ -25,6 +26,12 @@ const SEAM_SEGMENTS = 40;
 
 /** Cyan V→side lerp meridians (debug). Main blue seam lines are always shown. */
 const SHOW_FRONT_V_TO_ARC_GUIDES = false;
+
+/**
+ * Orange: ruled surface between left/right seam curves (straight 3D lerp at each height).
+ * The gray mesh uses a different construction — see {@link ruledSurfaceVertexBetweenSeams} vs panelVertex.
+ */
+const SHOW_CROWN_RULER_DEBUG = true;
 
 /** Slight radial push so guide lines draw on top of the mesh (same path as vertices). */
 const FRONT_GUIDE_RADIAL_OFFSET = 0.002;
@@ -102,6 +109,63 @@ export function buildHatGroup(sk: BuiltSkeleton): THREE.Group {
   );
   crown.name = "Crown";
   root.add(crown);
+
+  if (SHOW_CROWN_RULER_DEBUG) {
+    const M = crownArcSegments(sk.spec);
+    const N = crownVerticalRings(sk.spec);
+    const mat = new THREE.LineBasicMaterial({
+      color: 0xffaa00,
+      depthTest: true,
+      transparent: true,
+      opacity: 0.9,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+    const nSeams = sk.spec.nSeams;
+    for (let panel = 0; panel < nSeams; panel++) {
+      for (let j = 0; j <= M; j += 2) {
+        const pts: [number, number, number][] = [];
+        for (let k = 0; k <= N; k++) {
+          pts.push(ruledSurfaceVertexBetweenSeams(sk, panel, j, k, M, N));
+        }
+        const line = new THREE.Line(lineStripToBuffer(pts), mat);
+        line.renderOrder = 3;
+        line.name = `CrownRulerMeridian_p${panel}_j${j}`;
+        root.add(line);
+      }
+      if (M % 2 === 1) {
+        const pts: [number, number, number][] = [];
+        for (let k = 0; k <= N; k++) {
+          pts.push(ruledSurfaceVertexBetweenSeams(sk, panel, M, k, M, N));
+        }
+        const line = new THREE.Line(lineStripToBuffer(pts), mat);
+        line.renderOrder = 3;
+        line.name = `CrownRulerMeridian_p${panel}_j${M}`;
+        root.add(line);
+      }
+      for (let k = 0; k <= N; k += 2) {
+        const pts: [number, number, number][] = [];
+        for (let j = 0; j <= M; j++) {
+          pts.push(ruledSurfaceVertexBetweenSeams(sk, panel, j, k, M, N));
+        }
+        const line = new THREE.Line(lineStripToBuffer(pts), mat);
+        line.renderOrder = 3;
+        line.name = `CrownRulerRing_p${panel}_k${k}`;
+        root.add(line);
+      }
+      if (N % 2 === 1) {
+        const pts: [number, number, number][] = [];
+        for (let j = 0; j <= M; j++) {
+          pts.push(ruledSurfaceVertexBetweenSeams(sk, panel, j, N, M, N));
+        }
+        const line = new THREE.Line(lineStripToBuffer(pts), mat);
+        line.renderOrder = 3;
+        line.name = `CrownRulerRing_p${panel}_k${N}`;
+        root.add(line);
+      }
+    }
+  }
 
   const sweatbandGeo = buildSweatbandGeometry(sk, {
     closure: sk.spec.backClosureOpening === true,
