@@ -200,19 +200,10 @@ export function uniformSeamAngles(nSeams: number): Float64Array {
  */
 export function panelSeamAngles(nSeams: PanelCount): Float64Array {
   const twoPi = 2 * Math.PI;
-  if (nSeams === 5) {
-    // Midpoint of arc between first two seams at π/2 → α₀ = π/2 − π/5 = 3π/10.
-    const α0 = 0.5 * Math.PI - twoPi / 10;
-    const step = twoPi / 5;
-    const out = new Float64Array(5);
-    for (let i = 0; i < 5; i++) out[i] = α0 + i * step;
-    return out;
-  }
-  // 6-panel: seam at π/2 → offset π/6.
   const offset = 0.5 * Math.PI - twoPi / 6;
   const step = twoPi / 6;
-  const out = new Float64Array(6);
-  for (let i = 0; i < 6; i++) out[i] = offset + i * step;
+  const out = new Float64Array(nSeams);
+  for (let i = 0; i < nSeams; i++) out[i] = offset + i * step;
   return out;
 }
 
@@ -421,12 +412,10 @@ export function defaultSeamEndpointStyleFromSquareness(squareness: number): Seam
   const s = Math.min(1, Math.max(0, squareness));
   return {
     bottomStrength: s,
-    /** With plane lock: 0 = vertical (+Z in seam plane); π/2 = outward +v. */
-    bottomAngleRad: 0,
+    bottomAngleRad: (40 * Math.PI) / 180,
     topStrength: s,
-    /** Used when plane lock is off, or as fallback if horizontal radial projects to zero. */
-    topAngleRad: 0.5 * Math.PI,
-    lockAnglesToSeamPlane: true,
+    topAngleRad: -Math.PI / 4,
+    lockAnglesToSeamPlane: false,
   };
 }
 
@@ -624,95 +613,6 @@ export function solveLambdaForSeamCubicArcLength(
   return 0.5 * (lo + hi);
 }
 
-/**
- * Quadratic → cubic degree elevation (same curve, new control points).
- * See e.g. Farin, Curves and Surfaces for CAGD.
- */
-export function elevateQuadraticBezierToCubic(
-  q0: Vec3,
-  q1: Vec3,
-  q2: Vec3
-): [Vec3, Vec3, Vec3, Vec3] {
-  const c0: Vec3 = [q0[0], q0[1], q0[2]];
-  const c3: Vec3 = [q2[0], q2[1], q2[2]];
-  const c1 = add(c0, scale(sub(q1, q0), 2 / 3));
-  const c2 = add(c3, scale(sub(q1, q2), 2 / 3));
-  return [c0, c1, c2, c3];
-}
-
-/** True if every sample on the cubic stays at least as far from the z-axis as the straight chord (outward bulge vs chord). */
-function cubicSeamStaysOutwardVsChord(
-  p0: Vec3,
-  p1: Vec3,
-  p2: Vec3,
-  p3: Vec3,
-  rim: Vec3,
-  top: Vec3
-): boolean {
-  const eps = 2e-7;
-  for (let s = 1; s < 40; s++) {
-    const t = s / 40;
-    const p = evalCubicBezier(p0, p1, p2, p3, t);
-    const q: Vec3 = [
-      rim[0] + t * (top[0] - rim[0]),
-      rim[1] + t * (top[1] - rim[1]),
-      rim[2] + t * (top[2] - rim[2]),
-    ];
-    const rp = Math.hypot(p[0], p[1]);
-    const rq = Math.hypot(q[0], q[1]);
-    if (rq < 1e-5) continue;
-    if (rp < rq - eps) return false;
-  }
-  return true;
-}
-
-/**
- * Scale both handles uniformly: P1' = P0 + λ(P1−P0), P2' = P3 − λ(P3−P2), λ ∈ [0,1] for shortening.
- * Used to match arc length on a fixed-shape cubic (e.g. degree-elevated quadratic).
- */
-export function solveLambdaUniformCubicHandles(
-  p0: Vec3,
-  p1: Vec3,
-  p2: Vec3,
-  p3: Vec3,
-  targetLength: number
-): number {
-  const LAt = (lam: number): number => {
-    const p1s = add(p0, scale(sub(p1, p0), lam));
-    const p2s = sub(p3, scale(sub(p3, p2), lam));
-    return cubicBezierArcLength(p0, p1s, p2s, p3);
-  };
-  const chordLen = len(sub(p3, p0));
-  if (chordLen < 1e-15) return 0;
-  const L0 = LAt(0);
-  if (targetLength <= L0 + 1e-9) return 0;
-
-  let hi = 1;
-  let Lhi = LAt(hi);
-  if (targetLength > Lhi + 1e-9) {
-    for (let k = 0; k < 12; k++) {
-      Lhi = LAt(hi);
-      if (Lhi >= targetLength - 1e-9) break;
-      hi *= 2;
-      if (hi > 1e6) break;
-    }
-  }
-  if (LAt(hi) < targetLength - 1e-9) {
-    return hi;
-  }
-  let lo = 0;
-  for (let i = 0; i < SEAM_LAMBDA_MAX_ITERS; i++) {
-    const mid = 0.5 * (lo + hi);
-    const L = LAt(mid);
-    if (Math.abs(L - targetLength) <= SEAM_ARC_LENGTH_TOL_M) {
-      return mid;
-    }
-    if (L < targetLength) lo = mid;
-    else hi = mid;
-  }
-  return 0.5 * (lo + hi);
-}
-
 export function buildSeamCubicControlPoints(
   rim: Vec3,
   top: Vec3,
@@ -720,19 +620,7 @@ export function buildSeamCubicControlPoints(
   targetArcLength: number
 ): [Vec3, Vec3, Vec3, Vec3] {
   const lam = solveLambdaForSeamCubicArcLength(rim, top, style, targetArcLength);
-  const primary = buildSeamCubicWithLambda(rim, top, style, lam);
-  const [a0, a1, a2, a3] = primary;
-  const outward = cubicSeamStaysOutwardVsChord(a0, a1, a2, a3, rim, top);
-  if (outward) {
-    return primary;
-  }
-  const s = Math.min(1, Math.max(0, 0.5 * (style.bottomStrength + style.topStrength)));
-  const [q0, q1, q2] = seamQuadraticBezier(rim, top, s);
-  const [c0, c1, c2, c3] = elevateQuadraticBezierToCubic(q0, q1, q2);
-  const lamU = solveLambdaUniformCubicHandles(c0, c1, c2, c3, targetArcLength);
-  const p1 = add(c0, scale(sub(c1, c0), lamU));
-  const p2 = sub(c3, scale(sub(c3, c2), lamU));
-  return [c0, p1, p2, c3];
+  return buildSeamCubicWithLambda(rim, top, style, lam);
 }
 
 /** Unit normal for the plane containing rim, vPoint, top (front V). */
@@ -1212,12 +1100,31 @@ export function evalSeamSuperellipse(
   return add(add(mid, scale(uVec, lx)), scale(perp, ly));
 }
 
-export function visorOuterPolyline(
+export interface SampleVisorSuperellipseOptions {
+  /** Multiply half-chord length `a` (homothety in chord direction). */
+  aScale: number;
+  /** Multiply projection `b` (homothety in outward direction). */
+  bScale: number;
+  /** Start of chord parameter `s` (same convention as visor: typically -1). */
+  sMin: number;
+  /** End of chord parameter `s` (typically 1). */
+  sMax: number;
+  /** Number of samples along the curve segment. */
+  samples: number;
+}
+
+/**
+ * Sample the visor superellipse in the same chord frame as {@link visorOuterPolyline}.
+ * Nested curves (threading, etc.) use `aScale`/`bScale` &lt; 1 and/or a narrower `[sMin, sMax]`.
+ */
+export function sampleVisorSuperellipsePolyline(
   semiAxisX: number,
   semiAxisY: number,
   yawRad: number,
-  spec: VisorSpec
+  spec: VisorSpec,
+  options: SampleVisorSuperellipseOptions,
 ): [number, number, number][] {
+  const { aScale, bScale, sMin, sMax, samples: mIn } = options;
   const c = spec.attachAngleRad;
   const left = sweatbandPoint(c - spec.halfSpanRad, semiAxisX, semiAxisY, yawRad);
   const right = sweatbandPoint(c + spec.halfSpanRad, semiAxisX, semiAxisY, yawRad);
@@ -1230,19 +1137,38 @@ export function visorOuterPolyline(
   let outward = cross(uVec, Z_UP);
   outward = norm(outward);
   const halfWidth = 0.5 * chordLen;
-  const a = Math.max(halfWidth, 1e-6);
-  const b = spec.projection;
-  const m = Math.max(8, spec.samples);
+  let a = Math.max(halfWidth, 1e-6) * aScale;
+  let b = spec.projection * bScale;
+  a = Math.max(a, 1e-9);
+  b = Math.max(b, 0);
+  const m = Math.max(2, Math.floor(mIn));
+  const nExp = spec.mode === "circular" ? 2 : spec.superellipseN;
   const pts: [number, number, number][] = [];
   for (let i = 0; i < m; i++) {
-    const s = -1 + (2 * i) / (m - 1);
-    const nExp = spec.mode === "circular" ? 2 : spec.superellipseN;
+    const t = m <= 1 ? 0 : i / (m - 1);
+    const s = sMin + (sMax - sMin) * t;
     const [lx, ly] = superellipseOffset(s, a, b, nExp);
     const along = scale(uVec, lx);
     const out = scale(outward, ly);
     pts.push(add(add(rimMid, along), out));
   }
   return pts;
+}
+
+export function visorOuterPolyline(
+  semiAxisX: number,
+  semiAxisY: number,
+  yawRad: number,
+  spec: VisorSpec
+): [number, number, number][] {
+  const m = Math.max(8, spec.samples);
+  return sampleVisorSuperellipsePolyline(semiAxisX, semiAxisY, yawRad, spec, {
+    aScale: 1,
+    bScale: 1,
+    sMin: -1,
+    sMax: 1,
+    samples: m,
+  });
 }
 
 export interface BuiltSkeleton {
@@ -1432,26 +1358,16 @@ export function buildSkeleton(
         bulgeFraction: bulge,
       });
     } else {
-      const s = effectiveSquarenessForSeam(spec, i);
+      const style = resolveSeamEndpointStyleForIndex(spec, i);
+      const targetLen = resolveSeamTargetArcLengthForIndex(spec, i, rim, topEnd);
       if (
-        spec.nSeams === 5 &&
-        spec.fivePanelFrontSeams !== null &&
-        (i === 0 || i === 1)
+        prev &&
+        canReuseCubicSeamFromPrev(prev, i, spec, angles, rim, topEnd, useArcLength, useSuperellipse)
       ) {
-        const { visor, crown, splitT } = spec.fivePanelFrontSeams;
-        seamControls.push(buildSplitSeamCurve(rim, topEnd, visor, crown, splitT));
+        seamControls.push(prev.seamControls[i]!);
       } else {
-        const style = resolveSeamEndpointStyleForIndex(spec, i);
-        const targetLen = resolveSeamTargetArcLengthForIndex(spec, i, rim, topEnd);
-        if (
-          prev &&
-          canReuseCubicSeamFromPrev(prev, i, spec, angles, rim, topEnd, useArcLength, useSuperellipse)
-        ) {
-          seamControls.push(prev.seamControls[i]!);
-        } else {
-          const ctrl = buildSeamCubicControlPoints(rim, topEnd, style, targetLen);
-          seamControls.push({ kind: "cubic", ctrl });
-        }
+        const ctrl = buildSeamCubicControlPoints(rim, topEnd, style, targetLen);
+        seamControls.push({ kind: "cubic", ctrl });
       }
     }
   }

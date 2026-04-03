@@ -155,19 +155,11 @@ export function visorSpanRange(spec: HatSkeletonSpec): { min: number; max: numbe
 export function seamGroupIndices(
   nSeams: PanelCount
 ): { front: number[]; sideFront: number[]; sideBack: number[]; rear: number[] } {
-  if (nSeams === 6) {
-    return {
-      front: [1],
-      sideFront: [0, 2],
-      sideBack: [3, 5],
-      rear: [4],
-    };
-  }
   return {
-    front: [0, 1],
-    sideFront: [2, 4],
-    sideBack: [],
-    rear: [3],
+    front: [1],
+    sideFront: [0, 2],
+    sideBack: [3, 5],
+    rear: [4],
   };
 }
 

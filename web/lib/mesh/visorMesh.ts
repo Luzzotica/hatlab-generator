@@ -8,7 +8,6 @@ import {
 /** Brim slab thickness (skeleton units ≈ metres → 2 mm). */
 export const VISOR_THICKNESS_M = 0.002;
 
-/** Fillet radius (m) on top outer / inner rim; capped relative to thickness. */
 const FILLET_SEGMENTS = 5;
 
 function pushTriangle(
@@ -31,10 +30,6 @@ function pushQuad(
   pushTriangle(positions, a, c, d);
 }
 
-function offsetZ(p: [number, number, number], dz: number): [number, number, number] {
-  return [p[0], p[1], p[2] + dz];
-}
-
 /** Inward XY direction from point toward centroid (visor interior). */
 function inwardXY(
   p: [number, number, number],
@@ -49,10 +44,10 @@ function inwardXY(
 }
 
 /**
- * Fillet arc from (p, z0) vertical to (p + N*R, z1) with quarter-circle in (N, Z).
- * z0 = t - R, z1 = t. Returns FILLET_SEGMENTS + 1 points (θ = 0 … π/2).
+ * Top fillet: quarter-circle from (p, z=t-R) curving inward to (p+N*R, z=t).
+ * Returns FILLET_SEGMENTS+1 points (θ = 0 … π/2).
  */
-function filletArcPoints(
+function filletArcTop(
   p: [number, number, number],
   N: [number, number, number],
   R: number,
@@ -65,32 +60,59 @@ function filletArcPoints(
     const theta = (k / steps) * (0.5 * Math.PI);
     const inward = R - R * Math.cos(theta);
     const dz = R * Math.sin(theta);
-    out.push([
-      p[0] + N[0] * inward,
-      p[1] + N[1] * inward,
-      z0 + dz,
-    ]);
+    out.push([p[0] + N[0] * inward, p[1] + N[1] * inward, z0 + dz]);
   }
   return out;
 }
 
 /**
- * Filled visor: bottom at z=0 (sweatband plane), slab extends upward to z=THICKNESS.
- * Top outer rim and inner rim edges are rounded with fillets toward the patch centroid.
+ * Bottom fillet: quarter-circle from (p+N*R, z=0) curving outward to (p, z=R).
+ * Returns FILLET_SEGMENTS+1 points (θ = 0 … π/2).
  */
-export function buildVisorGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
+function filletArcBot(
+  p: [number, number, number],
+  N: [number, number, number],
+  R: number,
+  steps: number
+): [number, number, number][] {
+  const out: [number, number, number][] = [];
+  for (let k = 0; k <= steps; k++) {
+    const theta = (k / steps) * (0.5 * Math.PI);
+    const inward = R * Math.cos(theta);
+    const dz = R * Math.sin(theta);
+    out.push([p[0] + N[0] * inward, p[1] + N[1] * inward, dz]);
+  }
+  return out;
+}
+
+/** Shared intermediate data for visor geometry construction. */
+interface VisorSlabData {
+  m: number;
+  t: number;
+  R: number;
+  rim: [number, number, number][];
+  outer: [number, number, number][];
+  rimBotFlat: [number, number, number][];
+  outerBotFlat: [number, number, number][];
+  rimTopFlat: [number, number, number][];
+  outerTopFlat: [number, number, number][];
+  rimFilletBot: [number, number, number][][];
+  rimFilletTop: [number, number, number][][];
+  outerFilletBot: [number, number, number][][];
+  outerFilletTop: [number, number, number][][];
+}
+
+function computeVisorSlabData(sk: BuiltSkeleton): VisorSlabData | null {
   const outer = sk.visorPolyline;
   const m = outer.length;
-  const geo = new THREE.BufferGeometry();
-  if (m < 2) return geo;
+  if (m < 2) return null;
 
   const spec = sk.spec;
   const v = spec.visor;
   const halfSpan = effectiveVisorHalfSpanRad(v, spec.nSeams, sk.angles);
   const c = v.attachAngleRad;
   const t = VISOR_THICKNESS_M;
-  const R = Math.min(0.00055, t * 0.35);
-  const positions: number[] = [];
+  const R = t * 0.45;
 
   const rim: [number, number, number][] = [];
   for (let i = 0; i < m; i++) {
@@ -109,97 +131,174 @@ export function buildVisorGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
   cx /= nPts;
   cy /= nPts;
 
-  const Nrim: [number, number, number][] = rim.map((p) => inwardXY(p, cx, cy));
-  const Nout: [number, number, number][] = outer.map((p) => inwardXY(p, cx, cy));
+  const Nrim = rim.map((p) => inwardXY(p, cx, cy));
+  const Nout = outer.map((p) => inwardXY(p, cx, cy));
 
-  const rimBot = rim;
-  const outerBot = outer;
-  const rimTopFlat: [number, number, number][] = rim.map((p, i) => {
-    const N = Nrim[i]!;
-    return [p[0] + N[0] * R, p[1] + N[1] * R, t];
-  });
-  const outerTopFlat: [number, number, number][] = outer.map((p, i) => {
-    const N = Nout[i]!;
-    return [p[0] + N[0] * R, p[1] + N[1] * R, t];
-  });
+  return {
+    m,
+    t,
+    R,
+    rim,
+    outer: outer as [number, number, number][],
+    rimBotFlat: rim.map((p, i) => {
+      const N = Nrim[i]!;
+      return [p[0] + N[0] * R, p[1] + N[1] * R, 0] as [number, number, number];
+    }),
+    outerBotFlat: outer.map((p, i) => {
+      const N = Nout[i]!;
+      return [p[0] + N[0] * R, p[1] + N[1] * R, 0] as [number, number, number];
+    }),
+    rimTopFlat: rim.map((p, i) => {
+      const N = Nrim[i]!;
+      return [p[0] + N[0] * R, p[1] + N[1] * R, t] as [number, number, number];
+    }),
+    outerTopFlat: outer.map((p, i) => {
+      const N = Nout[i]!;
+      return [p[0] + N[0] * R, p[1] + N[1] * R, t] as [number, number, number];
+    }),
+    rimFilletBot: rim.map((p, i) => filletArcBot(p, Nrim[i]!, R, FILLET_SEGMENTS)),
+    rimFilletTop: rim.map((p, i) => filletArcTop(p, Nrim[i]!, R, t, FILLET_SEGMENTS)),
+    outerFilletBot: outer.map((p, i) => filletArcBot(p, Nout[i]!, R, FILLET_SEGMENTS)),
+    outerFilletTop: outer.map((p, i) => filletArcTop(p, Nout[i]!, R, t, FILLET_SEGMENTS)),
+  };
+}
 
-  const rimFillet = rim.map((p, i) => filletArcPoints(p, Nrim[i]!, R, t, FILLET_SEGMENTS));
-  const outerFillet = outer.map((p, i) => filletArcPoints(p, Nout[i]!, R, t, FILLET_SEGMENTS));
+/**
+ * Filled visor with filleted edges on both top and bottom.
+ * Bottom at z=0, top at z=THICKNESS. Both faces are inset by R.
+ * Each edge (inner rim, outer, end caps) has bottom fillet + straight wall + top fillet.
+ */
+export function buildVisorGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
+  const { top, bottom } = buildVisorTopBottomGeometries(sk);
+  const merged = new THREE.BufferGeometry();
+  const topAttr = top.getAttribute("position") as THREE.BufferAttribute | null;
+  const botAttr = bottom.getAttribute("position") as THREE.BufferAttribute | null;
+  const allPositions: number[] = [];
+  if (botAttr) for (let i = 0; i < botAttr.count * 3; i++) allPositions.push(botAttr.array[i]!);
+  if (topAttr) for (let i = 0; i < topAttr.count * 3; i++) allPositions.push(topAttr.array[i]!);
+  top.dispose();
+  bottom.dispose();
+  if (allPositions.length > 0) {
+    merged.setAttribute("position", new THREE.Float32BufferAttribute(allPositions, 3));
+    merged.computeVertexNormals();
+  }
+  return merged;
+}
 
-  // Bottom face (z=0, normal -Z)
-  for (let i = 0; i < m - 1; i++) {
-    const r0 = rimBot[i]!;
-    const r1 = rimBot[i + 1]!;
-    const o0 = outerBot[i]!;
-    const o1 = outerBot[i + 1]!;
-    pushTriangle(positions, r0, o0, r1);
-    pushTriangle(positions, r1, o0, o1);
+/** Shell above the bottom plane: top face, all fillets, and all vertical edge walls. */
+export function buildVisorTopGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
+  return buildVisorTopBottomGeometries(sk).top;
+}
+
+/** Underside plane only (rim–outer strip at z≈0); no edge wrap. */
+export function buildVisorBottomGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
+  return buildVisorTopBottomGeometries(sk).bottom;
+}
+
+export function buildVisorTopBottomGeometries(
+  sk: BuiltSkeleton,
+): { top: THREE.BufferGeometry; bottom: THREE.BufferGeometry } {
+  const data = computeVisorSlabData(sk);
+  if (!data) {
+    return { top: new THREE.BufferGeometry(), bottom: new THREE.BufferGeometry() };
   }
 
-  // Top flat (between inset boundaries, +Z)
+  const {
+    m, t, R, rim, outer,
+    rimBotFlat, outerBotFlat, rimTopFlat, outerTopFlat,
+    rimFilletBot, rimFilletTop, outerFilletBot, outerFilletTop,
+  } = data;
+
+  const zBotWall = R;
+  const zTopWall = t - R;
+
+  const topPos: number[] = [];
+  const botPos: number[] = [];
+
+  // Bottom mesh: flat underside only (meets hat at rim inset; outer edge inset).
   for (let i = 0; i < m - 1; i++) {
-    const r0 = rimTopFlat[i]!;
-    const r1 = rimTopFlat[i + 1]!;
-    const o0 = outerTopFlat[i]!;
-    const o1 = outerTopFlat[i + 1]!;
-    pushTriangle(positions, r0, r1, o0);
-    pushTriangle(positions, r1, o1, o0);
+    pushTriangle(botPos, rimBotFlat[i]!, outerBotFlat[i]!, rimBotFlat[i + 1]!);
+    pushTriangle(botPos, rimBotFlat[i + 1]!, outerBotFlat[i]!, outerBotFlat[i + 1]!);
   }
 
-  // Inner rim: vertical wall z=0 to z=t-R, then fillet strips between consecutive vertices
-  const zWall = t - R;
+  // Top mesh: top face + entire perimeter (all fillets and walls); one material to the edge.
   for (let i = 0; i < m - 1; i++) {
-    const r0b = rimBot[i]!;
-    const r1b = rimBot[i + 1]!;
-    const r0w = offsetZ(rimBot[i]!, zWall);
-    const r1w = offsetZ(rimBot[i + 1]!, zWall);
-    pushQuad(positions, r0b, r1b, r1w, r0w);
+    pushTriangle(topPos, rimTopFlat[i]!, rimTopFlat[i + 1]!, outerTopFlat[i]!);
+    pushTriangle(topPos, rimTopFlat[i + 1]!, outerTopFlat[i + 1]!, outerTopFlat[i]!);
+  }
+
+  // --- Inner rim edge ---
+  for (let i = 0; i < m - 1; i++) {
+    for (let k = 0; k < FILLET_SEGMENTS; k++) {
+      pushQuad(topPos,
+        rimFilletBot[i]![k]!, rimFilletBot[i + 1]![k]!,
+        rimFilletBot[i + 1]![k + 1]!, rimFilletBot[i]![k + 1]!);
+    }
+  }
+  for (let i = 0; i < m - 1; i++) {
+    const r0b: [number, number, number] = [rim[i]![0], rim[i]![1], zBotWall];
+    const r1b: [number, number, number] = [rim[i + 1]![0], rim[i + 1]![1], zBotWall];
+    const r0t: [number, number, number] = [rim[i]![0], rim[i]![1], zTopWall];
+    const r1t: [number, number, number] = [rim[i + 1]![0], rim[i + 1]![1], zTopWall];
+    pushQuad(topPos, r0b, r1b, r1t, r0t);
   }
   for (let i = 0; i < m - 1; i++) {
     for (let k = 0; k < FILLET_SEGMENTS; k++) {
-      const a0 = rimFillet[i]![k]!;
-      const a1 = rimFillet[i + 1]![k]!;
-      const c1 = rimFillet[i + 1]![k + 1]!;
-      const c0 = rimFillet[i]![k + 1]!;
-      pushQuad(positions, a0, a1, c1, c0);
+      pushQuad(topPos,
+        rimFilletTop[i]![k]!, rimFilletTop[i + 1]![k]!,
+        rimFilletTop[i + 1]![k + 1]!, rimFilletTop[i]![k + 1]!);
     }
   }
 
-  // Outer edge: vertical wall + fillet
+  // --- Outer edge ---
   for (let i = 0; i < m - 1; i++) {
-    const o0b = outerBot[i]!;
-    const o1b = outerBot[i + 1]!;
-    const o0w = offsetZ(outerBot[i]!, zWall);
-    const o1w = offsetZ(outerBot[i + 1]!, zWall);
-    pushQuad(positions, o0b, o0w, o1w, o1b);
+    for (let k = 0; k < FILLET_SEGMENTS; k++) {
+      pushQuad(topPos,
+        outerFilletBot[i]![k]!, outerFilletBot[i]![k + 1]!,
+        outerFilletBot[i + 1]![k + 1]!, outerFilletBot[i + 1]![k]!);
+    }
+  }
+  for (let i = 0; i < m - 1; i++) {
+    const o0b: [number, number, number] = [outer[i]![0], outer[i]![1], zBotWall];
+    const o1b: [number, number, number] = [outer[i + 1]![0], outer[i + 1]![1], zBotWall];
+    const o0t: [number, number, number] = [outer[i]![0], outer[i]![1], zTopWall];
+    const o1t: [number, number, number] = [outer[i + 1]![0], outer[i + 1]![1], zTopWall];
+    pushQuad(topPos, o0b, o1b, o1t, o0t);
   }
   for (let i = 0; i < m - 1; i++) {
     for (let k = 0; k < FILLET_SEGMENTS; k++) {
-      const a0 = outerFillet[i]![k]!;
-      const a1 = outerFillet[i+1]![k]!;
-      const c1 = outerFillet[i+1]![k + 1]!;
-      const c0 = outerFillet[i]![k + 1]!;
-      pushQuad(positions, a0, a1, c1, c0);
+      pushQuad(topPos,
+        outerFilletTop[i]![k]!, outerFilletTop[i]![k + 1]!,
+        outerFilletTop[i + 1]![k + 1]!, outerFilletTop[i + 1]![k]!);
     }
   }
 
-  // End caps: vertical wall + fillet quads between rim and outer columns
+  // --- End caps (left & right tips of visor) ---
   for (const side of [0, m - 1] as const) {
-    const rb = rimBot[side]!;
-    const ob = outerBot[side]!;
-    const rw = offsetZ(rimBot[side]!, zWall);
-    const ow = offsetZ(outerBot[side]!, zWall);
-    pushQuad(positions, rb, ob, ow, rw);
     for (let k = 0; k < FILLET_SEGMENTS; k++) {
-      const a0 = rimFillet[side]![k]!;
-      const a1 = outerFillet[side]![k]!;
-      const b1 = outerFillet[side]![k + 1]!;
-      const b0 = rimFillet[side]![k + 1]!;
-      pushQuad(positions, a0, a1, b1, b0);
+      pushQuad(topPos,
+        rimFilletBot[side]![k]!, outerFilletBot[side]![k]!,
+        outerFilletBot[side]![k + 1]!, rimFilletBot[side]![k + 1]!);
+    }
+    const rb: [number, number, number] = [rim[side]![0], rim[side]![1], zBotWall];
+    const ob: [number, number, number] = [outer[side]![0], outer[side]![1], zBotWall];
+    const rt: [number, number, number] = [rim[side]![0], rim[side]![1], zTopWall];
+    const ot: [number, number, number] = [outer[side]![0], outer[side]![1], zTopWall];
+    pushQuad(topPos, rb, ob, ot, rt);
+    for (let k = 0; k < FILLET_SEGMENTS; k++) {
+      pushQuad(topPos,
+        rimFilletTop[side]![k]!, outerFilletTop[side]![k]!,
+        outerFilletTop[side]![k + 1]!, rimFilletTop[side]![k + 1]!);
     }
   }
 
-  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geo.computeVertexNormals();
-  return geo;
+  const topGeo = new THREE.BufferGeometry();
+  topGeo.setAttribute("position", new THREE.Float32BufferAttribute(topPos, 3));
+  topGeo.computeVertexNormals();
+
+  const botGeo = new THREE.BufferGeometry();
+  botGeo.setAttribute("position", new THREE.Float32BufferAttribute(botPos, 3));
+  botGeo.computeVertexNormals();
+
+  return { top: topGeo, bottom: botGeo };
 }

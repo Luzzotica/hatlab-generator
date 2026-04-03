@@ -3,23 +3,25 @@ import type { BuiltSkeleton } from "@/lib/skeleton/geometry";
 import type { HatSkeletonSpec } from "@/lib/skeleton/types";
 import {
   BACK_CLOSURE_WIDTH_M,
+  BACK_CLOSURE_TAPE_MARGIN_M,
   getBackClosureOpeningFrame,
 } from "@/lib/mesh/backClosureSubtract";
 import {
+  CROWN_SHELL_THICKNESS_M,
   crownArcSegments,
   crownMeridianPointAtK,
   crownVerticalRings,
   findKRingForDeltaZ,
 } from "@/lib/mesh/crownMesh";
 
-/** Vertical rise (+Z in skeleton space) from the brim along each crown meridian (0.625 in). */
-export const SWEATBAND_HEIGHT_M = 0.625 * 0.0254;
+/** Vertical rise (+Z in skeleton space) from the brim along each crown meridian (0.9375 in). */
+export const SWEATBAND_HEIGHT_M = 0.9375 * 0.0254;
 
 /** Radial thickness (inner vs outer surface). */
 export const SWEATBAND_THICKNESS_M = 0.0015;
 
 /** XY inset from crown surface toward the head (m). */
-export const SWEATBAND_OUTER_INSET_M = 0.001;
+export const SWEATBAND_OUTER_INSET_M = CROWN_SHELL_THICKNESS_M;
 
 /** Samples around the rim (full ring) or along the front arc when closure is on. */
 export const SWEATBAND_SEGMENTS = 96;
@@ -32,7 +34,7 @@ function pushTriangle(
   positions: number[],
   a: [number, number, number],
   b: [number, number, number],
-  c: [number, number, number]
+  c: [number, number, number],
 ): void {
   positions.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]);
 }
@@ -42,7 +44,7 @@ function pushQuad(
   a: [number, number, number],
   b: [number, number, number],
   c: [number, number, number],
-  d: [number, number, number]
+  d: [number, number, number],
 ): void {
   pushTriangle(positions, a, b, c);
   pushTriangle(positions, a, c, d);
@@ -50,7 +52,7 @@ function pushQuad(
 
 function sub(
   a: [number, number, number],
-  b: [number, number, number]
+  b: [number, number, number],
 ): [number, number, number] {
   return [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 }
@@ -72,10 +74,7 @@ function radialInwardXY(p: [number, number, number]): [number, number, number] {
   return [-p[0] / L, -p[1] / L, 0];
 }
 
-function dot(
-  a: [number, number, number],
-  b: [number, number, number]
-): number {
+function dot(a: [number, number, number], b: [number, number, number]): number {
   return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
@@ -89,7 +88,11 @@ function normalizeAngle(theta: number): number {
  * Inverse of sweatband ellipse at z=0: world XY → θ (radians).
  * World = R_z(yaw) * [a cos θ, b sin θ, 0].
  */
-export function rimWorldXYToSweatbandTheta(spec: HatSkeletonSpec, x: number, y: number): number {
+export function rimWorldXYToSweatbandTheta(
+  spec: HatSkeletonSpec,
+  x: number,
+  y: number,
+): number {
   const c = Math.cos(-spec.yawRad);
   const s = Math.sin(-spec.yawRad);
   const lx = c * x - s * y;
@@ -101,7 +104,10 @@ export function rimWorldXYToSweatbandTheta(spec: HatSkeletonSpec, x: number, y: 
  * Long arc (front of hat) between closure rails: CCW span and starting θ.
  * Rails at θL, θR; rear gap is the shorter arc between them.
  */
-export function sweatbandFrontArcStartAndSpan(thetaL: number, thetaR: number): {
+export function sweatbandFrontArcStartAndSpan(
+  thetaL: number,
+  thetaR: number,
+): {
   start: number;
   span: number;
 } {
@@ -117,7 +123,7 @@ export function sweatbandFrontArcStartAndSpan(thetaL: number, thetaR: number): {
 /** Move p toward z-axis in XY by dist (inward). */
 function offsetInwardXY(
   p: [number, number, number],
-  dist: number
+  dist: number,
 ): [number, number, number] {
   const L = Math.hypot(p[0], p[1]);
   if (L < 1e-12) return [p[0], p[1], p[2]];
@@ -134,7 +140,7 @@ function outerSurfacePoint(
   kFloat: number,
   M: number,
   N: number,
-  inset: number
+  inset: number,
 ): [number, number, number] {
   const p = crownMeridianPointAtK(sk, theta, kFloat, M, N);
   return offsetInwardXY(p, inset);
@@ -148,7 +154,7 @@ function filletArcFromCorner(
   A: [number, number, number],
   B: [number, number, number],
   R: number,
-  steps: number
+  steps: number,
 ): [number, number, number][] {
   const N = radialInwardXY(A);
   let T = normalize3(sub(B, A));
@@ -179,7 +185,7 @@ function buildOuterColumn(
   N: number,
   inset: number,
   thickness: number,
-  heightScale = 1
+  heightScale = 1,
 ): { outer: [number, number, number][]; inner: [number, number, number][] } {
   const dz = Math.max(SWEATBAND_HEIGHT_M * heightScale, 1e-10);
   const kTop = findKRingForDeltaZ(sk, theta, M, N, dz);
@@ -234,7 +240,7 @@ export type SweatbandGeometryOptions = {
  */
 export function buildSweatbandGeometry(
   sk: BuiltSkeleton,
-  options: SweatbandGeometryOptions = {}
+  options: SweatbandGeometryOptions = {},
 ): THREE.BufferGeometry {
   const M = crownArcSegments(sk.spec);
   const N = crownVerticalRings(sk.spec);
@@ -249,7 +255,8 @@ export function buildSweatbandGeometry(
 
   if (closure) {
     const { tW, rimAnchor } = getBackClosureOpeningFrame(sk);
-    const halfW = BACK_CLOSURE_WIDTH_M * 0.5;
+    const halfW =
+      (BACK_CLOSURE_WIDTH_M + BACK_CLOSURE_TAPE_MARGIN_M) * 0.5 + 0.01;
     const left: [number, number, number] = [
       rimAnchor[0] - halfW * tW[0],
       rimAnchor[1] - halfW * tW[1],
@@ -270,7 +277,7 @@ export function buildSweatbandGeometry(
     } else {
       const denom = Math.max(nSeg - 1, 1);
       thetas = Array.from({ length: nSeg }, (_, i) =>
-        normalizeAngle(start + (i / denom) * span)
+        normalizeAngle(start + (i / denom) * span),
       );
       openArc = true;
     }
@@ -284,7 +291,14 @@ export function buildSweatbandGeometry(
 
   for (let i = 0; i < nSeg; i++) {
     const theta = thetas[i]!;
-    const { outer, inner } = buildOuterColumn(sk, theta, M, N, inset, thickness);
+    const { outer, inner } = buildOuterColumn(
+      sk,
+      theta,
+      M,
+      N,
+      inset,
+      thickness,
+    );
     outerCols.push(outer);
     innerCols.push(inner);
     if (ringCount === 0) ringCount = outer.length;

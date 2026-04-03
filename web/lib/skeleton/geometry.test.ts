@@ -10,6 +10,7 @@ import {
   frontPanelRimThetaBounds,
   effectiveVisorHalfSpanRad,
   visorOuterPolyline,
+  sampleVisorSuperellipsePolyline,
   evalSeamCurve,
   buildSplitSeamCurve,
   effectiveSquarenessForSeam,
@@ -85,11 +86,13 @@ describe("sweatbandTangentTheta", () => {
 });
 
 describe("panelSeamAngles", () => {
-  it("5-panel: front panel bisector at +Y (π/2), not a seam on center", () => {
-    const a = panelSeamAngles(5);
-    expect(a.length).toBe(5);
-    const mid01 = 0.5 * (a[0]! + a[1]!);
-    expect(mid01).toBeCloseTo(0.5 * Math.PI, 6);
+  it("5-panel: first 5 angles match 6-panel (nSeams always 6 at runtime)", () => {
+    const a5 = panelSeamAngles(5);
+    const a6 = panelSeamAngles(6);
+    expect(a5.length).toBe(5);
+    for (let i = 0; i < 5; i++) {
+      expect(a5[i]).toBeCloseTo(a6[i]!, 10);
+    }
   });
 
   it("6-panel: seam at +Y (π/2) for visor split", () => {
@@ -155,6 +158,30 @@ describe("visorOuterPolyline", () => {
     const d = (a: number[], b: number[]) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
     expect(d(p0, left)).toBeLessThan(1e-5);
     expect(d(p1, right)).toBeLessThan(1e-5);
+  });
+});
+
+describe("sampleVisorSuperellipsePolyline", () => {
+  it("matches visorOuterPolyline when aScale=bScale=1 and s spans [-1,1]", () => {
+    const semiX = 0.095;
+    const semiY = 0.11;
+    const yaw = 0;
+    const v = { ...defaultVisorSpec(), attachAngleRad: 0.5 * Math.PI, halfSpanRad: 0.35, samples: 24 };
+    const m = Math.max(8, v.samples);
+    const outer = visorOuterPolyline(semiX, semiY, yaw, v);
+    const sampled = sampleVisorSuperellipsePolyline(semiX, semiY, yaw, v, {
+      aScale: 1,
+      bScale: 1,
+      sMin: -1,
+      sMax: 1,
+      samples: m,
+    });
+    expect(sampled.length).toBe(outer.length);
+    for (let i = 0; i < outer.length; i++) {
+      expect(sampled[i]![0]).toBeCloseTo(outer[i]![0], 10);
+      expect(sampled[i]![1]).toBeCloseTo(outer[i]![1], 10);
+      expect(sampled[i]![2]).toBeCloseTo(outer[i]![2], 10);
+    }
   });
 });
 

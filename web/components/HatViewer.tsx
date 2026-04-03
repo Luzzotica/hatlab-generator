@@ -30,7 +30,7 @@ import {
   visorSpanRange,
 } from "@/lib/skeleton";
 import { resolveSeamEndpointStyleForIndex } from "@/lib/skeleton/geometry";
-import { buildHatGroupFromSpec } from "@/lib/hat/buildHatGroup";
+import { buildHatExportGroup } from "@/lib/hat/buildHatGroup";
 import type { MeasurementFieldHighlight } from "@/lib/hat/measurementHighlight";
 import { exportObjectToGLB, downloadBlob } from "@/lib/export/gltf";
 
@@ -123,17 +123,17 @@ function Panel({
       <div style={{ ...lab, marginBottom: 12 }}>
         <span style={{ fontWeight: 600 }}>Panels</span>
         <div style={{ display: "flex", gap: 8 }}>
-          {([5, 6] as const).map((n) => (
+          {([5, 6] as const).map((n) => {
+            const is5 = spec.fivePanelCenterSeamLength < 1;
+            const active = n === 5 ? is5 : !is5;
+            return (
             <button
               key={n}
               type="button"
               onClick={() =>
                 set({
-                  nSeams: n,
-                  seamAnglesRad: null,
-                  seamSquarenessOverrides: [],
-                  seamEndpointStyles: [],
-                  seamTargetArcLengthM: [],
+                  nSeams: 6 as const,
+                  fivePanelCenterSeamLength: n === 5 ? 0.36 : 1.0,
                 })
               }
               style={{
@@ -141,10 +141,10 @@ function Panel({
                 padding: "8px 10px",
                 borderRadius: 6,
                 border:
-                  spec.nSeams === n
+                  active
                     ? "1px solid #3b82f6"
                     : "1px solid #374151",
-                background: spec.nSeams === n ? "#1e3a5f" : "#1f2937",
+                background: active ? "#1e3a5f" : "#1f2937",
                 color: "#e5e7eb",
                 cursor: "pointer",
                 fontSize: 12,
@@ -152,7 +152,8 @@ function Panel({
             >
               {n}-panel
             </button>
-          ))}
+            );
+          })}
         </div>
       </div>
       <div
@@ -310,19 +311,14 @@ function Panel({
           }}
         >
           <span style={{ fontWeight: 600 }}>Seams (per region)</span>
-          {(spec.nSeams === 6
-            ? (["front", "sideFront", "sideBack", "rear"] as const)
-            : (["front", "sideFront", "rear"] as const)
-          ).map((key) => {
+          {(["front", "sideFront", "sideBack", "rear"] as const).map((key) => {
             const g = seamGroupIndices(spec.nSeams)[key];
             if (g.length === 0) return null;
             const idx = g[0]!;
             const st = resolveSeamEndpointStyleForIndex(spec, idx);
             const title =
               key === "front"
-                ? spec.nSeams === 6
-                  ? "Front center"
-                  : "Front (center)"
+                ? "Front center"
                 : key === "sideFront"
                   ? "Side-front (mirrored pair)"
                   : key === "sideBack"
@@ -473,6 +469,22 @@ function Panel({
                         />
                       </label>
                     )}
+                    {spec.fivePanelCenterSeamLength < 1 && (
+                      <label style={{ ...lab, marginTop: 8 }}>
+                        Front center seam length (from top, 5-panel)
+                        <input
+                          type="range"
+                          min={0.05}
+                          max={0.95}
+                          step={0.01}
+                          value={spec.fivePanelCenterSeamLength}
+                          onChange={(e) =>
+                            set({ fivePanelCenterSeamLength: Number(e.target.value) })
+                          }
+                        />
+                        <span>{(spec.fivePanelCenterSeamLength * 100).toFixed(0)}%</span>
+                      </label>
+                    )}
                   </div>
                 )}
 
@@ -492,7 +504,7 @@ function Panel({
                     />
                   </label>
                 )}
-                {key === "sideBack" && spec.nSeams === 6 && (
+                {key === "sideBack" && (
                   <label style={lab}>
                     Target arc length (rim → top)
                     <input
@@ -544,25 +556,22 @@ function Panel({
                   <span>{st.bottomStrength.toFixed(2)}</span>
                 </label>
                 <label style={lab}>
-                  Bottom angle (deg,{" "}
-                  {st.lockAnglesToSeamPlane
-                    ? "0 = straight up at rim, 90 = outward in plane"
-                    : "0 = along rim→top chord, 90 = outward in plane"}
+                  Bottom angle
                   <input
                     type="range"
                     min={-90}
                     max={90}
                     step={1}
-                    value={(st.bottomAngleRad * 180) / Math.PI}
+                    value={Math.round((st.bottomAngleRad * 180) / Math.PI - 40)}
                     onChange={(e) =>
                       set(
                         patchGroupEndpointStyle(spec, key, {
-                          bottomAngleRad: (Number(e.target.value) * Math.PI) / 180,
+                          bottomAngleRad: ((Number(e.target.value) + 40) * Math.PI) / 180,
                         })
                       )
                     }
                   />
-                  <span>{((st.bottomAngleRad * 180) / Math.PI).toFixed(0)}°</span>
+                  <span>{Math.round((st.bottomAngleRad * 180) / Math.PI - 40)}°</span>
                 </label>
                 <label style={lab}>
                   Top strength
@@ -582,40 +591,24 @@ function Panel({
                   />
                   <span>{st.topStrength.toFixed(2)}</span>
                 </label>
-                <label style={{ ...lab, flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <label style={lab}>
+                  Top angle
                   <input
-                    type="checkbox"
-                    checked={st.lockAnglesToSeamPlane}
+                    type="range"
+                    min={-90}
+                    max={90}
+                    step={1}
+                    value={Math.round((st.topAngleRad * 180) / Math.PI + 45)}
                     onChange={(e) =>
                       set(
                         patchGroupEndpointStyle(spec, key, {
-                          lockAnglesToSeamPlane: e.target.checked,
+                          topAngleRad: ((Number(e.target.value) - 45) * Math.PI) / 180,
                         })
                       )
                     }
                   />
-                  <span>Lock handle angles to seam plane</span>
+                  <span>{Math.round((st.topAngleRad * 180) / Math.PI + 45)}°</span>
                 </label>
-                {st.lockAnglesToSeamPlane ? null : (
-                  <label style={lab}>
-                    Top angle (deg)
-                    <input
-                      type="range"
-                      min={-90}
-                      max={90}
-                      step={1}
-                      value={(st.topAngleRad * 180) / Math.PI}
-                      onChange={(e) =>
-                        set(
-                          patchGroupEndpointStyle(spec, key, {
-                            topAngleRad: (Number(e.target.value) * Math.PI) / 180,
-                          })
-                        )
-                      }
-                    />
-                    <span>{((st.topAngleRad * 180) / Math.PI).toFixed(0)}°</span>
-                  </label>
-                )}
               </div>
             );
           })}
@@ -658,6 +651,20 @@ function Panel({
         <span>{spec.crownHeight.toFixed(3)}</span>
       </label>
       <label style={lab}>
+        Seam groove depth (mm, inward at seams)
+        <input
+          type="range"
+          min={0}
+          max={1.5}
+          step={0.05}
+          value={spec.seamGrooveDepthM * 1000}
+          onChange={(e) =>
+            set({ seamGrooveDepthM: Number(e.target.value) / 1000 })
+          }
+        />
+        <span>{(spec.seamGrooveDepthM * 1000).toFixed(2)}</span>
+      </label>
+      <label style={lab}>
         Top button ring (fraction of rim)
         <input
           type="range"
@@ -669,112 +676,6 @@ function Panel({
         />
         <span>{spec.topRimFraction.toFixed(3)}</span>
       </label>
-      {spec.nSeams === 5 && (
-        <div
-          style={{
-            ...lab,
-            borderTop: "1px solid #374151",
-            paddingTop: 10,
-          }}
-        >
-          <span style={{ fontWeight: 600 }}>5-panel front edges (seams 0 &amp; 1)</span>
-          <label style={{ ...lab, flexDirection: "row", alignItems: "center", gap: 8 }}>
-            <input
-              type="checkbox"
-              checked={spec.fivePanelFrontSeams !== null}
-              onChange={(e) =>
-                set({
-                  fivePanelFrontSeams: e.target.checked
-                    ? {
-                        visor: spec.seamSquareness,
-                        crown: spec.seamSquareness,
-                        splitT: 0.45,
-                      }
-                    : null,
-                })
-              }
-            />
-            <span>Split visor / crown along front seams</span>
-          </label>
-          {spec.fivePanelFrontSeams !== null && (
-            <>
-              <label style={lab}>
-                Visor segment (rim → split)
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={spec.fivePanelFrontSeams.visor}
-                  onChange={(e) =>
-                    set({
-                      fivePanelFrontSeams: {
-                        ...spec.fivePanelFrontSeams!,
-                        visor: Number(e.target.value),
-                      },
-                    })
-                  }
-                />
-                <span>{spec.fivePanelFrontSeams.visor.toFixed(2)}</span>
-              </label>
-              <label style={lab}>
-                Crown segment (split → button)
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={spec.fivePanelFrontSeams.crown}
-                  onChange={(e) =>
-                    set({
-                      fivePanelFrontSeams: {
-                        ...spec.fivePanelFrontSeams!,
-                        crown: Number(e.target.value),
-                      },
-                    })
-                  }
-                />
-                <span>{spec.fivePanelFrontSeams.crown.toFixed(2)}</span>
-              </label>
-              <label style={lab}>
-                Split position (along seam)
-                <input
-                  type="range"
-                  min={0.1}
-                  max={0.9}
-                  step={0.02}
-                  value={spec.fivePanelFrontSeams.splitT}
-                  onChange={(e) =>
-                    set({
-                      fivePanelFrontSeams: {
-                        ...spec.fivePanelFrontSeams!,
-                        splitT: Number(e.target.value),
-                      },
-                    })
-                  }
-                />
-                <span>{spec.fivePanelFrontSeams.splitT.toFixed(2)}</span>
-              </label>
-            </>
-          )}
-        </div>
-      )}
-      {spec.nSeams === 5 ? (
-        <label style={lab}>
-          5-panel center seam (from button)
-          <input
-            type="range"
-            min={0}
-            max={0.95}
-            step={0.02}
-            value={spec.fivePanelCenterSeamLength}
-            onChange={(e) =>
-              set({ fivePanelCenterSeamLength: Number(e.target.value) })
-            }
-          />
-          <span>{spec.fivePanelCenterSeamLength.toFixed(2)}</span>
-        </label>
-      ) : null}
       <div
         style={{
           ...lab,
@@ -878,7 +779,7 @@ export function HatViewer() {
     }
     setExporting(true);
     try {
-      const g = buildHatGroupFromSpec(spec);
+      const g = buildHatExportGroup(spec);
       const blob = await exportObjectToGLB(g);
       g.traverse((o) => {
         if (o instanceof THREE.Mesh) {
@@ -886,10 +787,6 @@ export function HatViewer() {
           const m = o.material;
           if (Array.isArray(m)) m.forEach((x) => x.dispose());
           else m.dispose();
-        }
-        if (o instanceof THREE.Line || o instanceof THREE.LineSegments) {
-          o.geometry.dispose();
-          (o.material as THREE.Material).dispose();
         }
       });
       downloadBlob(blob, "hat-skeleton.glb");

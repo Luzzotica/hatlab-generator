@@ -2,7 +2,6 @@ import * as THREE from "three";
 import type { HatSkeletonSpec } from "@/lib/skeleton/types";
 import type { BuiltSkeleton } from "@/lib/skeleton/geometry";
 import {
-  evalCubicBezier,
   evalQuadraticBezier,
   evalSeamCurve,
   evalSeamSuperellipse,
@@ -18,21 +17,31 @@ import {
 } from "@/lib/skeleton/geometry";
 
 /** Vertical rings from rim (u=0) to apex (u=1), following seam curves on panel edges. */
-export const CROWN_VERTICAL_RINGS = 24;
+export const CROWN_VERTICAL_RINGS = 48;
 
 /** Finer vertical rings when front V-split is on (smaller quads along the sharp fold). */
-export const CROWN_VERTICAL_RINGS_VSPLIT = 48;
+export const CROWN_VERTICAL_RINGS_VSPLIT = 64;
 
 /** Default crown fabric thickness (m); inner surface is offset along outward normals. */
-export const CROWN_SHELL_THICKNESS_M = 0.001;
+export const CROWN_SHELL_THICKNESS_M = 0.002;
 
-/** Segments along the sweatband arc between two seams (bottom follows ellipse, not a chord). */
-export const ARC_SEGMENTS_DEFAULT = 10;
+/**
+ * Maximum arc-segment width (m) at the widest panel rim. `buildCrownPanelGeometries` raises
+ * M until every rim segment is ≤ this size so the single-vertex seam groove reads as a
+ * consistent thin line from bottom to top.
+ */
+const CROWN_MAX_ARC_SEGMENT_M = 0.001;
+
+/**
+ * Logical arc segments between two seams (used by seam tape, sweatband, debug viz).
+ * The crown render mesh may use a higher M via the adaptive cap above.
+ */
+export const ARC_SEGMENTS_DEFAULT = 32;
 /**
  * When front V-split is active: more columns between center front and side seams so the mesh
  * follows the lerp meridians and the hard V without large stretched quads.
  */
-export const ARC_SEGMENTS_VSPLIT = 28;
+export const ARC_SEGMENTS_VSPLIT = 40;
 
 export function crownArcSegments(spec: HatSkeletonSpec): number {
   return spec.frontVSplit != null ? ARC_SEGMENTS_VSPLIT : ARC_SEGMENTS_DEFAULT;
@@ -151,8 +160,7 @@ function topEndForTheta(sk: BuiltSkeleton, theta: number): [number, number, numb
 
 /**
  * Crown vertex at grid position (panel, jArc, kRing). Edges (j=0, j=M) evaluate the seam curves
- * directly. Interior vertices in squareness/cubic mode use the ruled surface between the two seam
- * curves with an additive ellipse correction so the rim follows the sweatband.
+ * directly and get a radial indent (the seam groove). Interior vertices use unindented paths.
  */
 export function panelVertex(
   sk: BuiltSkeleton,
@@ -169,10 +177,12 @@ export function panelVertex(
   const seamR = sk.seamControls[(panel + 1) % n]!;
 
   if (jArc === 0) {
-    return evalSeamCurve(seamL, u);
+    const sc = frontSeamIndentScale(spec, panel, u);
+    return seamIndent(evalSeamCurve(seamL, u), spec.seamGrooveDepthM * sc);
   }
   if (jArc === M) {
-    return evalSeamCurve(seamR, u);
+    const sc = frontSeamIndentScale(spec, (panel + 1) % n, u);
+    return seamIndent(evalSeamCurve(seamR, u), spec.seamGrooveDepthM * sc);
   }
 
   if (seamL.kind === "vSplit" || seamR.kind === "vSplit") {
@@ -185,39 +195,72 @@ export function panelVertex(
   const theta = panelInteriorTheta(sk.angles, panel, jArc, M);
   const rim = sweatbandPoint(theta, spec.semiAxisX, spec.semiAxisY, spec.yawRad);
   const blend = jArc / M;
-
   const topEnd = topEndForTheta(sk, theta);
 
   if (spec.seamCurveMode === "arcLength") {
-    const s = solveSquarenessForArcLengthMultiplier(
-      rim,
-      topEnd,
-      spec.seamArcLengthMultiplier
-    );
+    const s = solveSquarenessForArcLengthMultiplier(rim, topEnd, spec.seamArcLengthMultiplier);
     const [p0, p1, p2] = seamQuadraticBezier(rim, topEnd, s);
     return evalQuadraticBezier(p0, p1, p2, u);
   }
 
   if (spec.seamCurveMode === "superellipse") {
-    if (spec.nSeams === 5 && spec.fivePanelFrontSeams !== null && panel === 0) {
-      const { visor, crown } = spec.fivePanelFrontSeams;
-      const bulge = (1 - u) * visor + u * crown;
-      return evalSeamSuperellipse(rim, topEnd, spec.seamSuperellipseN ?? 3, bulge, u);
-    }
     const sL = effectiveSquarenessForSeam(spec, panel);
     const sR = effectiveSquarenessForSeam(spec, (panel + 1) % n);
     const bulge = sL * (1 - blend) + sR * blend;
     return evalSeamSuperellipse(rim, topEnd, spec.seamSuperellipseN ?? 3, bulge, u);
   }
 
-  if (spec.nSeams === 5 && spec.fivePanelFrontSeams !== null && panel === 0) {
-    const { visor, crown } = spec.fivePanelFrontSeams;
-    const squareness = (1 - u) * visor + u * crown;
-    const [p0, p1, p2] = seamQuadraticBezier(rim, topEnd, squareness);
-    return evalQuadraticBezier(p0, p1, p2, u);
-  }
-
   return ruledSurfaceWithEllipseCorrection(sk, panel, jArc, kRing, M, N);
+}
+
+/**
+ * For 5-panel mode the front center seam indent fades in only above the cutoff,
+ * giving a smooth transition from "no seam" (flat face) to "full seam."
+ */
+function frontSeamIndentScale(spec: HatSkeletonSpec, seamIdx: number, u: number): number {
+  if (seamIdx !== frontCenterSeamIndex(spec.nSeams) || spec.fivePanelCenterSeamLength >= 1)
+    return 1;
+  const cutoff = 1 - spec.fivePanelCenterSeamLength;
+  if (u <= cutoff) return 0;
+  return Math.min(1, (u - cutoff) / 0.05);
+}
+
+/** Push a point radially inward (toward the Z axis) by `depthM` metres. */
+function seamIndent(
+  p: [number, number, number],
+  depthM: number
+): [number, number, number] {
+  if (depthM <= 0) return p;
+  const r = Math.hypot(p[0], p[1]);
+  if (r < 1e-10) return p;
+  const s = Math.max(0, 1 - depthM / r);
+  return [p[0] * s, p[1] * s, p[2]];
+}
+
+/**
+ * Sample a seam like {@link sampleSeamWireframeTo} in geometry, then apply the same radial
+ * groove indent as {@link panelVertex} on seam edges so threading follows the visible seam.
+ */
+export function sampleSeamWireframeToWithGroove(
+  sk: BuiltSkeleton,
+  seamIdx: number,
+  segments: number,
+  uMax: number,
+): [number, number, number][] {
+  const curve = sk.seamControls[seamIdx]!;
+  const spec = sk.spec;
+  const tEnd = Math.max(0, Math.min(1, uMax));
+  const pts: [number, number, number][] = [];
+  for (let i = 0; i <= segments; i++) {
+    const t = (i / segments) * tEnd;
+    const raw =
+      curve.kind === "vSplit"
+        ? evalSeamCurve({ ...curve, blend: 1 }, t)
+        : evalSeamCurve(curve, t);
+    const sc = frontSeamIndentScale(spec, seamIdx, t);
+    pts.push(seamIndent(raw, spec.seamGrooveDepthM * sc));
+  }
+  return pts;
 }
 
 /**
@@ -415,108 +458,130 @@ export function samplePanelMeridian(
  * (see {@link CROWN_SHELL_THICKNESS_M}).
  */
 export function buildCrownGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
+  const geos = buildCrownPanelGeometries(sk);
+  const merged = new THREE.BufferGeometry();
+  const allPositions: number[] = [];
+  for (const g of geos) {
+    const attr = g.getAttribute("position") as THREE.BufferAttribute;
+    for (let i = 0; i < attr.count * 3; i++) allPositions.push(attr.array[i]!);
+    g.dispose();
+  }
+  merged.setAttribute("position", new THREE.Float32BufferAttribute(allPositions, 3));
+  merged.computeVertexNormals();
+  return merged;
+}
+
+/** One BufferGeometry per crown panel (outer + inner shell, rim wall, top wall). */
+export function buildCrownPanelGeometries(sk: BuiltSkeleton): THREE.BufferGeometry[] {
   const n = sk.spec.nSeams;
-  const M = crownArcSegments(sk.spec);
   const N = crownVerticalRings(sk.spec);
-  const positions: number[] = [];
+  const M_logic = crownArcSegments(sk.spec);
+
+  let maxPanelChord = 0;
+  for (let i = 0; i < n; i++) {
+    const a = sk.rimPoints[i]!;
+    const b = sk.rimPoints[(i + 1) % n]!;
+    maxPanelChord = Math.max(maxPanelChord, Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]));
+  }
+  const M = Math.max(M_logic, Math.ceil(maxPanelChord / CROWN_MAX_ARC_SEGMENT_M));
+
   const collapseTop = (sk.spec.topRimFraction ?? 0) <= 1e-12;
   const t = CROWN_SHELL_THICKNESS_M;
-
-  function pushOuterStrip(
-    k: number,
-    v00: [number, number, number],
-    v10: [number, number, number],
-    v01: [number, number, number],
-    v11: [number, number, number]
-  ): void {
-    const lastStrip = k === N - 1;
-    if (!lastStrip || !collapseTop) {
-      pushTriangle(positions, v00, v10, v01);
-      pushTriangle(positions, v10, v11, v01);
-    } else {
-      pushTriangle(positions, v00, v10, v01);
-    }
-  }
-
-  function pushInnerStrip(
-    k: number,
-    i00: [number, number, number],
-    i10: [number, number, number],
-    i01: [number, number, number],
-    i11: [number, number, number]
-  ): void {
-    const lastStrip = k === N - 1;
-    if (!lastStrip || !collapseTop) {
-      pushTriangle(positions, i00, i01, i10);
-      pushTriangle(positions, i10, i01, i11);
-    } else {
-      pushTriangle(positions, i00, i01, i10);
-    }
-  }
+  const geos: THREE.BufferGeometry[] = [];
 
   for (let panel = 0; panel < n; panel++) {
-    for (let k = 0; k < N; k++) {
-      for (let j = 0; j < M; j++) {
-        const v00 = panelVertex(sk, panel, j, k, M, N);
-        const v10 = panelVertex(sk, panel, j + 1, k, M, N);
-        const v01 = panelVertex(sk, panel, j, k + 1, M, N);
-        const v11 = panelVertex(sk, panel, j + 1, k + 1, M, N);
-        pushOuterStrip(k, v00, v10, v01, v11);
+    const positions: number[] = [];
+
+    const outer: [number, number, number][][] = new Array(M + 1);
+    for (let j = 0; j <= M; j++) {
+      outer[j] = new Array(N + 1);
+      for (let k = 0; k <= N; k++) {
+        outer[j]![k] = panelVertex(sk, panel, j, k, M, N);
       }
     }
-  }
 
-  for (let panel = 0; panel < n; panel++) {
-    for (let k = 0; k < N; k++) {
-      for (let j = 0; j < M; j++) {
-        const i00 = offsetCrownVertexInward(sk, panel, j, k, M, N, t);
-        const i10 = offsetCrownVertexInward(sk, panel, j + 1, k, M, N, t);
-        const i01 = offsetCrownVertexInward(sk, panel, j, k + 1, M, N, t);
-        const i11 = offsetCrownVertexInward(sk, panel, j + 1, k + 1, M, N, t);
-        pushInnerStrip(k, i00, i10, i01, i11);
+    const normals: [number, number, number][][] = new Array(M + 1);
+    for (let j = 0; j <= M; j++) {
+      normals[j] = new Array(N + 1);
+      for (let k = 0; k <= N; k++) {
+        const pjL = outer[j > 0 ? j - 1 : j]![k]!;
+        const pjR = outer[j < M ? j + 1 : j]![k]!;
+        const pkL = outer[j]![k > 0 ? k - 1 : k]!;
+        const pkR = outer[j]![k < N ? k + 1 : k]!;
+        const du = sub3(pjR, pjL);
+        const dv = sub3(pkR, pkL);
+        let nm = cross3(du, dv);
+        let len = Math.hypot(nm[0], nm[1], nm[2]);
+        if (len < 1e-12) {
+          const p = outer[j]![k]!;
+          const r = Math.hypot(p[0], p[1]);
+          nm = r < 1e-12 ? [0, 0, 1] : [p[0] / r, p[1] / r, 0];
+          len = 1;
+        }
+        normals[j]![k] = [nm[0] / len, nm[1] / len, nm[2] / len];
       }
     }
-  }
 
-  for (let panel = 0; panel < n; panel++) {
+    const inner: [number, number, number][][] = new Array(M + 1);
+    for (let j = 0; j <= M; j++) {
+      inner[j] = new Array(N + 1);
+      for (let k = 0; k <= N; k++) {
+        const p = outer[j]![k]!;
+        const nm = normals[j]![k]!;
+        inner[j]![k] = [p[0] - t * nm[0], p[1] - t * nm[1], p[2] - t * nm[2]];
+      }
+    }
+
+    for (let k = 0; k < N; k++) {
+      const lastStrip = k === N - 1;
+      for (let j = 0; j < M; j++) {
+        const v00 = outer[j]![k]!;
+        const v10 = outer[j + 1]![k]!;
+        const v01 = outer[j]![k + 1]!;
+        const v11 = outer[j + 1]![k + 1]!;
+        if (!lastStrip || !collapseTop) {
+          pushTriangle(positions, v00, v10, v01);
+          pushTriangle(positions, v10, v11, v01);
+        } else {
+          pushTriangle(positions, v00, v10, v01);
+        }
+      }
+    }
+
+    for (let k = 0; k < N; k++) {
+      const lastStrip = k === N - 1;
+      for (let j = 0; j < M; j++) {
+        const i00 = inner[j]![k]!;
+        const i10 = inner[j + 1]![k]!;
+        const i01 = inner[j]![k + 1]!;
+        const i11 = inner[j + 1]![k + 1]!;
+        if (!lastStrip || !collapseTop) {
+          pushTriangle(positions, i00, i01, i10);
+          pushTriangle(positions, i10, i01, i11);
+        } else {
+          pushTriangle(positions, i00, i01, i10);
+        }
+      }
+    }
+
     for (let j = 0; j < M; j++) {
-      const o0 = panelVertex(sk, panel, j, 0, M, N);
-      const o1 = panelVertex(sk, panel, j + 1, 0, M, N);
-      const i0 = offsetCrownVertexInward(sk, panel, j, 0, M, N, t);
-      const i1 = offsetCrownVertexInward(sk, panel, j + 1, 0, M, N, t);
-      pushTriangle(positions, o0, i0, o1);
-      pushTriangle(positions, o1, i0, i1);
+      pushTriangle(positions, outer[j]![0]!, inner[j]![0]!, outer[j + 1]![0]!);
+      pushTriangle(positions, outer[j + 1]![0]!, inner[j]![0]!, inner[j + 1]![0]!);
     }
-  }
 
-  if (collapseTop) {
-    for (let panel = 0; panel < n; panel++) {
-      const k = N - 1;
+    {
+      const k = collapseTop ? N - 1 : N;
       for (let j = 0; j < M; j++) {
-        const o0 = panelVertex(sk, panel, j, k, M, N);
-        const o1 = panelVertex(sk, panel, j + 1, k, M, N);
-        const i0 = offsetCrownVertexInward(sk, panel, j, k, M, N, t);
-        const i1 = offsetCrownVertexInward(sk, panel, j + 1, k, M, N, t);
-        pushTriangle(positions, o0, o1, i1);
-        pushTriangle(positions, o0, i1, i0);
+        pushTriangle(positions, outer[j]![k]!, outer[j + 1]![k]!, inner[j + 1]![k]!);
+        pushTriangle(positions, outer[j]![k]!, inner[j + 1]![k]!, inner[j]![k]!);
       }
     }
-  } else {
-    for (let panel = 0; panel < n; panel++) {
-      const k = N;
-      for (let j = 0; j < M; j++) {
-        const o0 = panelVertex(sk, panel, j, k, M, N);
-        const o1 = panelVertex(sk, panel, j + 1, k, M, N);
-        const i0 = offsetCrownVertexInward(sk, panel, j, k, M, N, t);
-        const i1 = offsetCrownVertexInward(sk, panel, j + 1, k, M, N, t);
-        pushTriangle(positions, o0, o1, i1);
-        pushTriangle(positions, o0, i1, i0);
-      }
-    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geo.computeVertexNormals();
+    geos.push(geo);
   }
 
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geo.computeVertexNormals();
-  return geo;
+  return geos;
 }

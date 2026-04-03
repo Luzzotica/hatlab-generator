@@ -25,8 +25,8 @@ export const BACK_CLOSURE_TOTAL_HEIGHT_M =
  * Thin slab along +surface normal only — must not extend deep into the interior or CSG
  * removes the front of the shell too. Straddles the outer surface with a small inward bias.
  */
-const CLOSURE_CUT_DEPTH_M = 0.026;
-const CLOSURE_CUT_INWARD_BIAS_M = 0.007;
+const CLOSURE_CUT_DEPTH_M = 0.08;
+const CLOSURE_CUT_INWARD_BIAS_M = 0.04;
 
 /**
  * Move the opening toward the brim along −tH (from seam rim toward band). The seam sample at u=0
@@ -39,7 +39,7 @@ export const BACK_CLOSURE_TAPE_MARGIN_M = 0.01;
 
 function cross(
   a: readonly [number, number, number],
-  b: readonly [number, number, number]
+  b: readonly [number, number, number],
 ): [number, number, number] {
   return [
     a[1] * b[2] - a[2] * b[1],
@@ -48,7 +48,10 @@ function cross(
   ];
 }
 
-function dot(a: readonly [number, number, number], b: readonly [number, number, number]): number {
+function dot(
+  a: readonly [number, number, number],
+  b: readonly [number, number, number],
+): number {
   return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
@@ -58,11 +61,17 @@ function norm(v: readonly [number, number, number]): [number, number, number] {
   return [v[0] / L, v[1] / L, v[2] / L];
 }
 
-function sub(a: readonly [number, number, number], b: readonly [number, number, number]): [number, number, number] {
+function sub(
+  a: readonly [number, number, number],
+  b: readonly [number, number, number],
+): [number, number, number] {
   return [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 }
 
-function scale(v: readonly [number, number, number], s: number): [number, number, number] {
+function scale(
+  v: readonly [number, number, number],
+  s: number,
+): [number, number, number] {
   return [v[0] * s, v[1] * s, v[2] * s];
 }
 
@@ -89,8 +98,12 @@ function seamTangentU(curve: SeamCurve, t: number): [number, number, number] {
 function openingFrame(
   eTheta: [number, number, number],
   eU: [number, number, number],
-  p: [number, number, number]
-): { tW: [number, number, number]; tH: [number, number, number]; n: [number, number, number] } {
+  p: [number, number, number],
+): {
+  tW: [number, number, number];
+  tH: [number, number, number];
+  n: [number, number, number];
+} {
   let nRaw = cross(eTheta, eU);
   if (Math.hypot(nRaw[0], nRaw[1], nRaw[2]) < 1e-10) {
     nRaw = cross(eTheta, [0, 0, 1]);
@@ -138,7 +151,12 @@ export function getBackClosureOpeningFrame(sk: BuiltSkeleton): {
 
   const pRim = evalSeamCurve(seam, 0);
   const uTiny = 1e-5;
-  const eTheta = sweatbandTangentTheta(theta, spec.semiAxisX, spec.semiAxisY, spec.yawRad);
+  const eTheta = sweatbandTangentTheta(
+    theta,
+    spec.semiAxisX,
+    spec.semiAxisY,
+    spec.yawRad,
+  );
   const eU = seamTangentU(seam, uTiny);
 
   const { tW, tH, n } = openingFrame(eTheta, eU, pRim);
@@ -151,15 +169,19 @@ function applyClosureBasisToGeometry(
   tW: [number, number, number],
   tH: [number, number, number],
   n: [number, number, number],
-  rimCenter: [number, number, number]
+  rimCenter: [number, number, number],
 ): void {
   const basis = new THREE.Matrix4();
   basis.makeBasis(
     new THREE.Vector3(tW[0], tW[1], tW[2]),
     new THREE.Vector3(tH[0], tH[1], tH[2]),
-    new THREE.Vector3(n[0], n[1], n[2])
+    new THREE.Vector3(n[0], n[1], n[2]),
   );
-  const pos = new THREE.Matrix4().makeTranslation(rimCenter[0], rimCenter[1], rimCenter[2]);
+  const pos = new THREE.Matrix4().makeTranslation(
+    rimCenter[0],
+    rimCenter[1],
+    rimCenter[2],
+  );
   const transform = new THREE.Matrix4().multiplyMatrices(pos, basis);
   geo.applyMatrix4(transform);
 }
@@ -168,7 +190,10 @@ function applyClosureBasisToGeometry(
  * Stadium profile: flat bottom on rim, vertical sides for `straightM`, then semicircle (diameter = widthM).
  * Local 2D: x = width (circumferential), y = height along seam-up (tH). Total height = straightM + widthM/2.
  */
-export function buildStadiumShape(widthM: number, straightM: number): THREE.Shape {
+export function buildStadiumShape(
+  widthM: number,
+  straightM: number,
+): THREE.Shape {
   const halfW = widthM * 0.5;
   const R = halfW;
   const h = straightM;
@@ -182,7 +207,10 @@ export function buildStadiumShape(widthM: number, straightM: number): THREE.Shap
 }
 
 /** Inner boundary for {@link buildStadiumShape}, opposite winding for use as `Shape.holes` entry. */
-export function buildStadiumHolePath(widthM: number, straightM: number): THREE.Path {
+export function buildStadiumHolePath(
+  widthM: number,
+  straightM: number,
+): THREE.Path {
   const halfW = widthM * 0.5;
   const R = halfW;
   const h = straightM;
@@ -204,7 +232,7 @@ function buildClosureCutterGeometry(
   tW: [number, number, number],
   tH: [number, number, number],
   n: [number, number, number],
-  rimCenter: [number, number, number]
+  rimCenter: [number, number, number],
 ): THREE.BufferGeometry {
   const shape = buildStadiumShape(widthM, straightM);
 
@@ -219,46 +247,111 @@ function buildClosureCutterGeometry(
   return geo;
 }
 
+/** Debug: 3D outline of the stadium cutter profile in world space (for wireframe overlay). */
+export function getClosureCutterOutline(
+  sk: BuiltSkeleton,
+): [number, number, number][] {
+  const { tW, tH, rimAnchor } = getBackClosureOpeningFrame(sk);
+  const w = BACK_CLOSURE_WIDTH_M + BACK_CLOSURE_TAPE_MARGIN_M;
+  const s = BACK_CLOSURE_STRAIGHT_EDGE_M + BACK_CLOSURE_TAPE_MARGIN_M;
+  const shape = buildStadiumShape(w, s);
+  const pts2d = shape.getPoints(64);
+  return pts2d.map((v) => {
+    const lx = v.x;
+    const ly = v.y;
+    return [
+      rimAnchor[0] + lx * tW[0] + ly * tH[0],
+      rimAnchor[1] + lx * tW[1] + ly * tH[1],
+      rimAnchor[2] + lx * tW[2] + ly * tH[2],
+    ] as [number, number, number];
+  });
+}
+
 /**
  * Hollow cut at the rear seam: crown is an open shell — use HOLLOW_SUBTRACTION (not SUBTRACTION)
  * to avoid spurious internal geometry. Cutter is a thin prism (flat bottom, straight sides, arc top).
  */
 export function subtractBackClosureFromCrown(
   crownGeometry: THREE.BufferGeometry,
-  sk: BuiltSkeleton
+  sk: BuiltSkeleton,
 ): THREE.BufferGeometry {
   const { tW, tH, n, rimAnchor } = getBackClosureOpeningFrame(sk);
 
   const cutterGeo = buildClosureCutterGeometry(
-    BACK_CLOSURE_WIDTH_M,
-    BACK_CLOSURE_STRAIGHT_EDGE_M,
+    BACK_CLOSURE_WIDTH_M + BACK_CLOSURE_TAPE_MARGIN_M,
+    BACK_CLOSURE_STRAIGHT_EDGE_M + BACK_CLOSURE_TAPE_MARGIN_M,
     CLOSURE_CUT_DEPTH_M,
     CLOSURE_CUT_INWARD_BIAS_M,
     tW,
     tH,
     n,
-    rimAnchor
+    rimAnchor,
   );
 
-  const crownClone = crownGeometry.clone();
-  const crownGeo = mergeVertices(crownClone, 1e-5);
-  crownClone.dispose();
-  crownGeo.computeVertexNormals();
+  const result = hollowSubtract(crownGeometry, cutterGeo);
+  cutterGeo.dispose();
+  return result;
+}
+
+/**
+ * Apply back-closure CSG to per-panel geometries. Only the two panels adjacent to the
+ * rear seam are cut; the rest are returned unchanged.
+ */
+export function subtractBackClosureFromPanels(
+  panelGeos: THREE.BufferGeometry[],
+  sk: BuiltSkeleton,
+): THREE.BufferGeometry[] {
+  const { tW, tH, n, rimAnchor } = getBackClosureOpeningFrame(sk);
+
+  const cutterGeo = buildClosureCutterGeometry(
+    BACK_CLOSURE_WIDTH_M + BACK_CLOSURE_TAPE_MARGIN_M,
+    BACK_CLOSURE_STRAIGHT_EDGE_M + BACK_CLOSURE_TAPE_MARGIN_M,
+    CLOSURE_CUT_DEPTH_M,
+    CLOSURE_CUT_INWARD_BIAS_M,
+    tW,
+    tH,
+    n,
+    rimAnchor,
+  );
+
+  const nSeams = sk.spec.nSeams;
+  const rearIdx = rearCenterSeamIndex(nSeams);
+  const leftPanel = (rearIdx - 1 + nSeams) % nSeams;
+  const rightPanel = rearIdx % nSeams;
+
+  const result = panelGeos.map((geo, i) => {
+    if (i !== leftPanel && i !== rightPanel) return geo;
+    const cut = hollowSubtract(geo, cutterGeo);
+    geo.dispose();
+    return cut;
+  });
+
+  cutterGeo.dispose();
+  return result;
+}
+
+function hollowSubtract(
+  targetGeo: THREE.BufferGeometry,
+  cutterGeo: THREE.BufferGeometry,
+): THREE.BufferGeometry {
+  const targetClone = targetGeo.clone();
+  const merged = mergeVertices(targetClone, 1e-5);
+  targetClone.dispose();
+  merged.computeVertexNormals();
 
   const matA = new THREE.MeshStandardMaterial();
   const matB = new THREE.MeshStandardMaterial();
-  const crownBrush = new Brush(crownGeo, matA);
+  const targetBrush = new Brush(merged, matA);
   const cutterBrush = new Brush(cutterGeo, matB);
 
-  crownBrush.updateMatrixWorld();
+  targetBrush.updateMatrixWorld();
   cutterBrush.updateMatrixWorld();
 
   const evaluator = new Evaluator();
   evaluator.attributes = ["position", "normal"];
-  const out = evaluator.evaluate(crownBrush, cutterBrush, HOLLOW_SUBTRACTION);
+  const out = evaluator.evaluate(targetBrush, cutterBrush, HOLLOW_SUBTRACTION);
 
-  crownGeo.dispose();
-  cutterGeo.dispose();
+  merged.dispose();
   matA.dispose();
   matB.dispose();
 

@@ -172,6 +172,12 @@ export interface HatSkeletonSpec {
    * When true, subtract a fixed rectangular opening (3" × 2.75") at the rear center seam on the crown mesh.
    */
   backClosureOpening: boolean;
+  /**
+   * Radial inward groove depth at panel seams on the outer crown (metres). The crown shell is ~2 mm
+   * thick; the inner surface follows with a smooth falloff so the seam reads as rounded inward.
+   * Typical ~0.0005 (0.5 mm).
+   */
+  seamGrooveDepthM: number;
   visor: VisorSpec;
 }
 
@@ -201,11 +207,12 @@ export const defaultHatSkeletonSpec = (): HatSkeletonSpec => ({
   seamSquareness: 0.35,
   seamSquarenessOverrides: [],
   seamEndpointStyles: [],
-  seamTargetArcLengthM: [],
+  seamTargetArcLengthM: [0.165, 0.175, 0.165, 0.165, 0.175, 0.165],
   sixPanelSeams: null,
   fivePanelFrontSeams: { visor: 0.35, crown: 0.35, splitT: 0.45 },
-  fivePanelCenterSeamLength: 0.36,
+  fivePanelCenterSeamLength: 1.0,
   backClosureOpening: false,
+  seamGrooveDepthM: 0.0005,
   visor: defaultVisorSpec(),
 });
 
@@ -229,6 +236,7 @@ export function mergeHatSpecDefaults(spec: HatSkeletonSpec): HatSkeletonSpec {
     backClosureOpening: spec.backClosureOpening ?? d.backClosureOpening,
     seamEndpointStyles: spec.seamEndpointStyles ?? d.seamEndpointStyles,
     seamTargetArcLengthM: spec.seamTargetArcLengthM ?? d.seamTargetArcLengthM,
+    seamGrooveDepthM: spec.seamGrooveDepthM ?? d.seamGrooveDepthM,
     visor: { ...d.visor, ...spec.visor },
   };
 }
@@ -282,6 +290,10 @@ export function validateSpec(spec: HatSkeletonSpec): void {
   }
   if (spec.topRimFraction < 0 || spec.topRimFraction > 0.35) {
     throw new Error("topRimFraction must be in [0, 0.35]");
+  }
+  const g = spec.seamGrooveDepthM ?? defaultHatSkeletonSpec().seamGrooveDepthM;
+  if (g < 0 || g > 0.003) {
+    throw new Error("seamGrooveDepthM must be in [0, 0.003]");
   }
   if (
     spec.seamCurveMode !== "squareness" &&
