@@ -4,9 +4,82 @@ import {
   effectiveVisorHalfSpanRad,
   sweatbandPoint,
 } from "@/lib/skeleton/geometry";
+import {
+  CROWN_SHELL_THICKNESS_M,
+  crownArcSegments,
+  crownMeridianPointAtK,
+  crownVerticalRings,
+  findKRingForDeltaZ,
+} from "@/lib/mesh/crownMesh";
+import {
+  outerSurfacePoint,
+  SWEATBAND_OUTER_INSET_M,
+} from "@/lib/mesh/sweatbandMesh";
 
 /** Brim slab thickness (skeleton units ≈ metres → 2 mm). */
 export const VISOR_THICKNESS_M = 0.002;
+
+/**
+ * Per-sample local Z offset along the visor outer edge (before {@link VISOR_Z_BASE}),
+ * matching {@link computeVisorSlabData}. Zero at tips, maximum at span center.
+ * Positive = outer edge curves upward in skeleton +Z.
+ */
+export function computeVisorOuterCurvatureZArray(
+  m: number,
+  curvatureM: number,
+): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < m; i++) {
+    out.push(curvatureM * Math.sin((Math.PI * i) / (m - 1)));
+  }
+  return out;
+}
+
+/** Same curvature Z array as the visor slab for the built skeleton's visor polyline. */
+export function visorOuterCurvatureZLocal(sk: BuiltSkeleton): number[] {
+  const m = sk.visorPolyline.length;
+  if (m < 2) return [];
+  return computeVisorOuterCurvatureZArray(m, sk.spec.visor.visorCurvatureM ?? 0);
+}
+
+/**
+ * Z offset applied to the entire visor slab so it sits *under* the crown rim.
+ * Top surface lands at z ≈ 0 (flush with the rim); bottom at z ≈ −thickness.
+ */
+export const VISOR_Z_BASE = -VISOR_THICKNESS_M;
+
+/**
+ * Radial pull toward the hat center (XY) so the visor sits inside the crown /
+ * inner-front rise instead of intersecting the inner mesh. ~1.5× shell thickness
+ * clears the brim–inner offset; tune if the edge still clips.
+ */
+const VISOR_RADIAL_INSET_M = CROWN_SHELL_THICKNESS_M * 1.5 - 0.001;
+
+/**
+ * Radial XY scale only (matches visor mesh); leaves Z unchanged — use for threading
+ * with separate topZ/botZ that already include {@link VISOR_Z_BASE}.
+ */
+export function applyVisorSlabXYOnly(
+  p: [number, number, number],
+): [number, number, number] {
+  const L = Math.hypot(p[0], p[1]);
+  if (L < 1e-12) return [p[0], p[1], p[2]];
+  const s = 1 - VISOR_RADIAL_INSET_M / L;
+  return [p[0] * s, p[1] * s, p[2]];
+}
+
+/**
+ * Same XY radial inset + Z shift applied to all visor slab vertices (bottom, top, wrap).
+ */
+export function applyVisorSlabTransform(
+  p: [number, number, number],
+): [number, number, number] {
+  const [x, y] = applyVisorSlabXYOnly(p);
+  return [x, y, p[2] + VISOR_Z_BASE];
+}
+
+/** How far the tuck strip rises along the crown meridian under the hat. */
+export const VISOR_TUCK_HEIGHT_M = 0.006;
 
 const FILLET_SEGMENTS = 5;
 
@@ -14,7 +87,7 @@ function pushTriangle(
   positions: number[],
   a: [number, number, number],
   b: [number, number, number],
-  c: [number, number, number]
+  c: [number, number, number],
 ): void {
   positions.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]);
 }
@@ -24,7 +97,7 @@ function pushQuad(
   a: [number, number, number],
   b: [number, number, number],
   c: [number, number, number],
-  d: [number, number, number]
+  d: [number, number, number],
 ): void {
   pushTriangle(positions, a, b, c);
   pushTriangle(positions, a, c, d);
@@ -34,7 +107,7 @@ function pushQuad(
 function inwardXY(
   p: [number, number, number],
   cx: number,
-  cy: number
+  cy: number,
 ): [number, number, number] {
   const dx = cx - p[0];
   const dy = cy - p[1];
@@ -44,7 +117,7 @@ function inwardXY(
 }
 
 /**
- * Top fillet: quarter-circle from (p, z=t-R) curving inward to (p+N*R, z=t).
+ * Top fillet: quarter-circle from (p, z=baseZ+t-R) curving inward to (p+N*R, z=baseZ+t).
  * Returns FILLET_SEGMENTS+1 points (θ = 0 … π/2).
  */
 function filletArcTop(
@@ -52,9 +125,10 @@ function filletArcTop(
   N: [number, number, number],
   R: number,
   t: number,
-  steps: number
+  steps: number,
+  baseZ = 0,
 ): [number, number, number][] {
-  const z0 = t - R;
+  const z0 = baseZ + t - R;
   const out: [number, number, number][] = [];
   for (let k = 0; k <= steps; k++) {
     const theta = (k / steps) * (0.5 * Math.PI);
@@ -66,21 +140,22 @@ function filletArcTop(
 }
 
 /**
- * Bottom fillet: quarter-circle from (p+N*R, z=0) curving outward to (p, z=R).
+ * Bottom fillet: quarter-circle from (p+N*R, z=baseZ) curving outward to (p, z=baseZ+R).
  * Returns FILLET_SEGMENTS+1 points (θ = 0 … π/2).
  */
 function filletArcBot(
   p: [number, number, number],
   N: [number, number, number],
   R: number,
-  steps: number
+  steps: number,
+  baseZ = 0,
 ): [number, number, number][] {
   const out: [number, number, number][] = [];
   for (let k = 0; k <= steps; k++) {
     const theta = (k / steps) * (0.5 * Math.PI);
     const inward = R * Math.cos(theta);
     const dz = R * Math.sin(theta);
-    out.push([p[0] + N[0] * inward, p[1] + N[1] * inward, dz]);
+    out.push([p[0] + N[0] * inward, p[1] + N[1] * inward, baseZ + dz]);
   }
   return out;
 }
@@ -90,6 +165,8 @@ interface VisorSlabData {
   m: number;
   t: number;
   R: number;
+  /** Per-sample z-displacement on the outer edge (+Z = up). Zero at tips, max at center. */
+  droop: number[];
   rim: [number, number, number][];
   outer: [number, number, number][];
   rimBotFlat: [number, number, number][];
@@ -118,7 +195,9 @@ function computeVisorSlabData(sk: BuiltSkeleton): VisorSlabData | null {
   for (let i = 0; i < m; i++) {
     const u = i / (m - 1);
     const theta = c - halfSpan + u * 2 * halfSpan;
-    rim.push(sweatbandPoint(theta, spec.semiAxisX, spec.semiAxisY, spec.yawRad));
+    rim.push(
+      sweatbandPoint(theta, spec.semiAxisX, spec.semiAxisY, spec.yawRad),
+    );
   }
 
   let cx = 0;
@@ -134,10 +213,13 @@ function computeVisorSlabData(sk: BuiltSkeleton): VisorSlabData | null {
   const Nrim = rim.map((p) => inwardXY(p, cx, cy));
   const Nout = outer.map((p) => inwardXY(p, cx, cy));
 
+  const droop = computeVisorOuterCurvatureZArray(m, v.visorCurvatureM ?? 0);
+
   return {
     m,
     t,
     R,
+    droop,
     rim,
     outer: outer as [number, number, number][],
     rimBotFlat: rim.map((p, i) => {
@@ -146,7 +228,11 @@ function computeVisorSlabData(sk: BuiltSkeleton): VisorSlabData | null {
     }),
     outerBotFlat: outer.map((p, i) => {
       const N = Nout[i]!;
-      return [p[0] + N[0] * R, p[1] + N[1] * R, 0] as [number, number, number];
+      return [p[0] + N[0] * R, p[1] + N[1] * R, droop[i]!] as [
+        number,
+        number,
+        number,
+      ];
     }),
     rimTopFlat: rim.map((p, i) => {
       const N = Nrim[i]!;
@@ -154,12 +240,24 @@ function computeVisorSlabData(sk: BuiltSkeleton): VisorSlabData | null {
     }),
     outerTopFlat: outer.map((p, i) => {
       const N = Nout[i]!;
-      return [p[0] + N[0] * R, p[1] + N[1] * R, t] as [number, number, number];
+      return [p[0] + N[0] * R, p[1] + N[1] * R, droop[i]! + t] as [
+        number,
+        number,
+        number,
+      ];
     }),
-    rimFilletBot: rim.map((p, i) => filletArcBot(p, Nrim[i]!, R, FILLET_SEGMENTS)),
-    rimFilletTop: rim.map((p, i) => filletArcTop(p, Nrim[i]!, R, t, FILLET_SEGMENTS)),
-    outerFilletBot: outer.map((p, i) => filletArcBot(p, Nout[i]!, R, FILLET_SEGMENTS)),
-    outerFilletTop: outer.map((p, i) => filletArcTop(p, Nout[i]!, R, t, FILLET_SEGMENTS)),
+    rimFilletBot: rim.map((p, i) =>
+      filletArcBot(p, Nrim[i]!, R, FILLET_SEGMENTS),
+    ),
+    rimFilletTop: rim.map((p, i) =>
+      filletArcTop(p, Nrim[i]!, R, t, FILLET_SEGMENTS),
+    ),
+    outerFilletBot: outer.map((p, i) =>
+      filletArcBot(p, Nout[i]!, R, FILLET_SEGMENTS, droop[i]!),
+    ),
+    outerFilletTop: outer.map((p, i) =>
+      filletArcTop(p, Nout[i]!, R, t, FILLET_SEGMENTS, droop[i]!),
+    ),
   };
 }
 
@@ -172,14 +270,23 @@ export function buildVisorGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
   const { top, bottom } = buildVisorTopBottomGeometries(sk);
   const merged = new THREE.BufferGeometry();
   const topAttr = top.getAttribute("position") as THREE.BufferAttribute | null;
-  const botAttr = bottom.getAttribute("position") as THREE.BufferAttribute | null;
+  const botAttr = bottom.getAttribute(
+    "position",
+  ) as THREE.BufferAttribute | null;
   const allPositions: number[] = [];
-  if (botAttr) for (let i = 0; i < botAttr.count * 3; i++) allPositions.push(botAttr.array[i]!);
-  if (topAttr) for (let i = 0; i < topAttr.count * 3; i++) allPositions.push(topAttr.array[i]!);
+  if (botAttr)
+    for (let i = 0; i < botAttr.count * 3; i++)
+      allPositions.push(botAttr.array[i]!);
+  if (topAttr)
+    for (let i = 0; i < topAttr.count * 3; i++)
+      allPositions.push(topAttr.array[i]!);
   top.dispose();
   bottom.dispose();
   if (allPositions.length > 0) {
-    merged.setAttribute("position", new THREE.Float32BufferAttribute(allPositions, 3));
+    merged.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(allPositions, 3),
+    );
     merged.computeVertexNormals();
   }
   return merged;
@@ -191,22 +298,47 @@ export function buildVisorTopGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
 }
 
 /** Underside plane only (rim–outer strip at z≈0); no edge wrap. */
-export function buildVisorBottomGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
+export function buildVisorBottomGeometry(
+  sk: BuiltSkeleton,
+): THREE.BufferGeometry {
   return buildVisorTopBottomGeometries(sk).bottom;
 }
 
+export type VisorTopBottomOptions = {
+  /**
+   * When true, omit inner-rim fillets + wall on the top shell (hat-attach edge).
+   * Use with {@link buildVisorFilletGeometry} so teal fillet replaces the gray band.
+   */
+  omitInnerRimInTop?: boolean;
+};
+
 export function buildVisorTopBottomGeometries(
   sk: BuiltSkeleton,
+  options?: VisorTopBottomOptions,
 ): { top: THREE.BufferGeometry; bottom: THREE.BufferGeometry } {
   const data = computeVisorSlabData(sk);
   if (!data) {
-    return { top: new THREE.BufferGeometry(), bottom: new THREE.BufferGeometry() };
+    return {
+      top: new THREE.BufferGeometry(),
+      bottom: new THREE.BufferGeometry(),
+    };
   }
 
   const {
-    m, t, R, rim, outer,
-    rimBotFlat, outerBotFlat, rimTopFlat, outerTopFlat,
-    rimFilletBot, rimFilletTop, outerFilletBot, outerFilletTop,
+    m,
+    t,
+    R,
+    droop,
+    rim,
+    outer,
+    rimBotFlat,
+    outerBotFlat,
+    rimTopFlat,
+    outerTopFlat,
+    rimFilletBot,
+    rimFilletTop,
+    outerFilletBot,
+    outerFilletTop,
   } = data;
 
   const zBotWall = R;
@@ -218,77 +350,170 @@ export function buildVisorTopBottomGeometries(
   // Bottom mesh: flat underside only (meets hat at rim inset; outer edge inset).
   for (let i = 0; i < m - 1; i++) {
     pushTriangle(botPos, rimBotFlat[i]!, outerBotFlat[i]!, rimBotFlat[i + 1]!);
-    pushTriangle(botPos, rimBotFlat[i + 1]!, outerBotFlat[i]!, outerBotFlat[i + 1]!);
+    pushTriangle(
+      botPos,
+      rimBotFlat[i + 1]!,
+      outerBotFlat[i]!,
+      outerBotFlat[i + 1]!,
+    );
   }
 
   // Top mesh: top face + entire perimeter (all fillets and walls); one material to the edge.
   for (let i = 0; i < m - 1; i++) {
     pushTriangle(topPos, rimTopFlat[i]!, rimTopFlat[i + 1]!, outerTopFlat[i]!);
-    pushTriangle(topPos, rimTopFlat[i + 1]!, outerTopFlat[i + 1]!, outerTopFlat[i]!);
+    pushTriangle(
+      topPos,
+      rimTopFlat[i + 1]!,
+      outerTopFlat[i + 1]!,
+      outerTopFlat[i]!,
+    );
   }
 
-  // --- Inner rim edge ---
-  for (let i = 0; i < m - 1; i++) {
-    for (let k = 0; k < FILLET_SEGMENTS; k++) {
-      pushQuad(topPos,
-        rimFilletBot[i]![k]!, rimFilletBot[i + 1]![k]!,
-        rimFilletBot[i + 1]![k + 1]!, rimFilletBot[i]![k + 1]!);
+  const omitInnerRim = options?.omitInnerRimInTop === true;
+  if (!omitInnerRim) {
+    // --- Inner rim edge (no droop — stays flush with sweatband) ---
+    for (let i = 0; i < m - 1; i++) {
+      for (let k = 0; k < FILLET_SEGMENTS; k++) {
+        pushQuad(
+          topPos,
+          rimFilletBot[i]![k]!,
+          rimFilletBot[i + 1]![k]!,
+          rimFilletBot[i + 1]![k + 1]!,
+          rimFilletBot[i]![k + 1]!,
+        );
+      }
     }
-  }
-  for (let i = 0; i < m - 1; i++) {
-    const r0b: [number, number, number] = [rim[i]![0], rim[i]![1], zBotWall];
-    const r1b: [number, number, number] = [rim[i + 1]![0], rim[i + 1]![1], zBotWall];
-    const r0t: [number, number, number] = [rim[i]![0], rim[i]![1], zTopWall];
-    const r1t: [number, number, number] = [rim[i + 1]![0], rim[i + 1]![1], zTopWall];
-    pushQuad(topPos, r0b, r1b, r1t, r0t);
-  }
-  for (let i = 0; i < m - 1; i++) {
-    for (let k = 0; k < FILLET_SEGMENTS; k++) {
-      pushQuad(topPos,
-        rimFilletTop[i]![k]!, rimFilletTop[i + 1]![k]!,
-        rimFilletTop[i + 1]![k + 1]!, rimFilletTop[i]![k + 1]!);
+    for (let i = 0; i < m - 1; i++) {
+      const r0b: [number, number, number] = [rim[i]![0], rim[i]![1], zBotWall];
+      const r1b: [number, number, number] = [
+        rim[i + 1]![0],
+        rim[i + 1]![1],
+        zBotWall,
+      ];
+      const r0t: [number, number, number] = [rim[i]![0], rim[i]![1], zTopWall];
+      const r1t: [number, number, number] = [
+        rim[i + 1]![0],
+        rim[i + 1]![1],
+        zTopWall,
+      ];
+      pushQuad(topPos, r0b, r1b, r1t, r0t);
+    }
+    for (let i = 0; i < m - 1; i++) {
+      for (let k = 0; k < FILLET_SEGMENTS; k++) {
+        pushQuad(
+          topPos,
+          rimFilletTop[i]![k]!,
+          rimFilletTop[i + 1]![k]!,
+          rimFilletTop[i + 1]![k + 1]!,
+          rimFilletTop[i]![k + 1]!,
+        );
+      }
     }
   }
 
-  // --- Outer edge ---
+  // --- Outer edge (z-values offset by per-sample droop) ---
   for (let i = 0; i < m - 1; i++) {
     for (let k = 0; k < FILLET_SEGMENTS; k++) {
-      pushQuad(topPos,
-        outerFilletBot[i]![k]!, outerFilletBot[i]![k + 1]!,
-        outerFilletBot[i + 1]![k + 1]!, outerFilletBot[i + 1]![k]!);
+      pushQuad(
+        topPos,
+        outerFilletBot[i]![k]!,
+        outerFilletBot[i]![k + 1]!,
+        outerFilletBot[i + 1]![k + 1]!,
+        outerFilletBot[i + 1]![k]!,
+      );
     }
   }
   for (let i = 0; i < m - 1; i++) {
-    const o0b: [number, number, number] = [outer[i]![0], outer[i]![1], zBotWall];
-    const o1b: [number, number, number] = [outer[i + 1]![0], outer[i + 1]![1], zBotWall];
-    const o0t: [number, number, number] = [outer[i]![0], outer[i]![1], zTopWall];
-    const o1t: [number, number, number] = [outer[i + 1]![0], outer[i + 1]![1], zTopWall];
+    const d0 = droop[i]!;
+    const d1 = droop[i + 1]!;
+    const o0b: [number, number, number] = [
+      outer[i]![0],
+      outer[i]![1],
+      d0 + zBotWall,
+    ];
+    const o1b: [number, number, number] = [
+      outer[i + 1]![0],
+      outer[i + 1]![1],
+      d1 + zBotWall,
+    ];
+    const o0t: [number, number, number] = [
+      outer[i]![0],
+      outer[i]![1],
+      d0 + zTopWall,
+    ];
+    const o1t: [number, number, number] = [
+      outer[i + 1]![0],
+      outer[i + 1]![1],
+      d1 + zTopWall,
+    ];
     pushQuad(topPos, o0b, o1b, o1t, o0t);
   }
   for (let i = 0; i < m - 1; i++) {
     for (let k = 0; k < FILLET_SEGMENTS; k++) {
-      pushQuad(topPos,
-        outerFilletTop[i]![k]!, outerFilletTop[i]![k + 1]!,
-        outerFilletTop[i + 1]![k + 1]!, outerFilletTop[i + 1]![k]!);
+      pushQuad(
+        topPos,
+        outerFilletTop[i]![k]!,
+        outerFilletTop[i]![k + 1]!,
+        outerFilletTop[i + 1]![k + 1]!,
+        outerFilletTop[i + 1]![k]!,
+      );
     }
   }
 
-  // --- End caps (left & right tips of visor) ---
+  // --- End caps (left & right tips of visor; droop[0]=droop[m-1]=0) ---
   for (const side of [0, m - 1] as const) {
+    const ds = droop[side]!;
     for (let k = 0; k < FILLET_SEGMENTS; k++) {
-      pushQuad(topPos,
-        rimFilletBot[side]![k]!, outerFilletBot[side]![k]!,
-        outerFilletBot[side]![k + 1]!, rimFilletBot[side]![k + 1]!);
+      pushQuad(
+        topPos,
+        rimFilletBot[side]![k]!,
+        outerFilletBot[side]![k]!,
+        outerFilletBot[side]![k + 1]!,
+        rimFilletBot[side]![k + 1]!,
+      );
     }
-    const rb: [number, number, number] = [rim[side]![0], rim[side]![1], zBotWall];
-    const ob: [number, number, number] = [outer[side]![0], outer[side]![1], zBotWall];
-    const rt: [number, number, number] = [rim[side]![0], rim[side]![1], zTopWall];
-    const ot: [number, number, number] = [outer[side]![0], outer[side]![1], zTopWall];
+    const rb: [number, number, number] = [
+      rim[side]![0],
+      rim[side]![1],
+      zBotWall,
+    ];
+    const ob: [number, number, number] = [
+      outer[side]![0],
+      outer[side]![1],
+      ds + zBotWall,
+    ];
+    const rt: [number, number, number] = [
+      rim[side]![0],
+      rim[side]![1],
+      zTopWall,
+    ];
+    const ot: [number, number, number] = [
+      outer[side]![0],
+      outer[side]![1],
+      ds + zTopWall,
+    ];
     pushQuad(topPos, rb, ob, ot, rt);
     for (let k = 0; k < FILLET_SEGMENTS; k++) {
-      pushQuad(topPos,
-        rimFilletTop[side]![k]!, outerFilletTop[side]![k]!,
-        outerFilletTop[side]![k + 1]!, rimFilletTop[side]![k + 1]!);
+      pushQuad(
+        topPos,
+        rimFilletTop[side]![k]!,
+        outerFilletTop[side]![k]!,
+        outerFilletTop[side]![k + 1]!,
+        rimFilletTop[side]![k + 1]!,
+      );
+    }
+  }
+
+  for (const arr of [topPos, botPos]) {
+    for (let i = 0; i < arr.length; i += 3) {
+      const [nx, ny, nz] = applyVisorSlabTransform([
+        arr[i]!,
+        arr[i + 1]!,
+        arr[i + 2]!,
+      ]);
+      arr[i] = nx;
+      arr[i + 1] = ny;
+      arr[i + 2] = nz;
     }
   }
 
@@ -301,4 +526,299 @@ export function buildVisorTopBottomGeometries(
   botGeo.computeVertexNormals();
 
   return { top: topGeo, bottom: botGeo };
+}
+
+// ---------------------------------------------------------------------------
+// Visor fillet: volumetric rounded transition from visor inner rim up into
+// the crown–sweatband channel.  Swept crescent profile along the inner rim arc.
+// ---------------------------------------------------------------------------
+
+/** Arc-profile resolution (points = steps + 1). */
+const FILLET_ARC_STEPS = 10;
+/** Radial wall thickness of the fillet shell (m). */
+const FILLET_WALL_M = 0.001;
+/** Inward bulge as a fraction of the A→B chord length. */
+const FILLET_BULGE_FRAC = 0.35;
+/** Inset fraction along SWEATBAND_OUTER_INSET_M for the crown target point (higher = deeper into gap). */
+const FILLET_INSET_U = 0.9;
+/** Fraction of VISOR_TUCK_HEIGHT_M used for the fillet top target (keeps it below crown surface). */
+const FILLET_HEIGHT_FRAC = 0.6;
+/** Number of columns at each end over which the fillet tapers to zero. */
+const FILLET_TAPER_COLS = 1;
+
+/**
+ * Volumetric fillet: a rounded crescent-profile tube swept along the visor
+ * inner rim arc, bridging from the visor bottom edge up into the gap between
+ * the crown shell and the sweatband.
+ *
+ * Cross-section per column (radial-Z plane):
+ * - Outer arc: sin-bulged curve from A (visor bottom rim) to B (crown surface),
+ *   bowing outward (away from hat center).
+ * - Inner arc: same curve offset inward by {@link FILLET_WALL_M}.
+ * - Caps seal the tube at bottom/top edges and at the two arc tips.
+ */
+export function buildVisorFilletGeometry(
+  sk: BuiltSkeleton,
+): THREE.BufferGeometry {
+  const data = computeVisorSlabData(sk);
+  if (!data) return new THREE.BufferGeometry();
+
+  const { m, rimBotFlat } = data;
+  const spec = sk.spec;
+  const v = spec.visor;
+  const halfSpan = effectiveVisorHalfSpanRad(v, spec.nSeams, sk.angles);
+  const center = v.attachAngleRad;
+  const M = crownArcSegments(spec);
+  const N = crownVerticalRings(spec);
+
+  type V3 = [number, number, number];
+  const outerCols: V3[][] = [];
+  const innerCols: V3[][] = [];
+
+  for (let i = 0; i < m; i++) {
+    const u = i / (m - 1);
+    const theta = center - halfSpan + u * 2 * halfSpan;
+
+    const A = applyVisorSlabTransform(rimBotFlat[i]!);
+    const kTarget = findKRingForDeltaZ(
+      sk,
+      theta,
+      M,
+      N,
+      VISOR_TUCK_HEIGHT_M * FILLET_HEIGHT_FRAC,
+    );
+    const B = outerSurfacePoint(
+      sk,
+      theta,
+      kTarget,
+      M,
+      N,
+      FILLET_INSET_U * SWEATBAND_OUTER_INSET_M,
+    );
+
+    const dx = B[0] - A[0];
+    const dy = B[1] - A[1];
+    const dz = B[2] - A[2];
+    const chordLen = Math.hypot(dx, dy, dz);
+
+    const outer: V3[] = [];
+    const inner: V3[] = [];
+
+    if (chordLen < 1e-8) {
+      for (let s = 0; s <= FILLET_ARC_STEPS; s++) {
+        outer.push([A[0], A[1], A[2]]);
+        inner.push([A[0], A[1], A[2]]);
+      }
+    } else {
+      const cdx = dx / chordLen;
+      const cdy = dy / chordLen;
+      const cdz = dz / chordLen;
+
+      const mx = (A[0] + B[0]) * 0.5;
+      const my = (A[1] + B[1]) * 0.5;
+      const mR = Math.hypot(mx, my);
+      const rx = mR > 1e-12 ? mx / mR : 1;
+      const ry = mR > 1e-12 ? my / mR : 0;
+
+      const dotRC = rx * cdx + ry * cdy;
+      let px = rx - dotRC * cdx;
+      let py = ry - dotRC * cdy;
+      let pz = -dotRC * cdz;
+      const pLen = Math.hypot(px, py, pz);
+      if (pLen > 1e-10) {
+        px /= pLen;
+        py /= pLen;
+        pz /= pLen;
+      }
+
+      // Negate so the bulge points inward (toward hat center), placing
+      // the fillet inside the hat between visor and crown/sweatband.
+      px = -px;
+      py = -py;
+      pz = -pz;
+
+      // Taper at the tips so the cross-section shrinks to zero smoothly.
+      let taper = 1;
+      if (i < FILLET_TAPER_COLS) {
+        taper = Math.sin((Math.PI / 2) * (i / FILLET_TAPER_COLS));
+      } else if (i > m - 1 - FILLET_TAPER_COLS) {
+        taper = Math.sin((Math.PI / 2) * ((m - 1 - i) / FILLET_TAPER_COLS));
+      }
+
+      const bulge = FILLET_BULGE_FRAC * chordLen * taper;
+      const wall = FILLET_WALL_M * taper;
+
+      for (let s = 0; s <= FILLET_ARC_STEPS; s++) {
+        const t = s / FILLET_ARC_STEPS;
+        const sinB = Math.sin(Math.PI * t) * bulge;
+
+        const ox = A[0] + dx * t + px * sinB;
+        const oy = A[1] + dy * t + py * sinB;
+        const oz = A[2] + dz * t + pz * sinB;
+        outer.push([ox, oy, oz]);
+
+        // Wall-thickness offset toward the crown shell (larger radius).
+        const oR = Math.hypot(ox, oy);
+        if (oR > 1e-12 && wall > 1e-8) {
+          const sc = (oR + wall) / oR;
+          inner.push([ox * sc, oy * sc, oz]);
+        } else {
+          inner.push([ox, oy, oz]);
+        }
+      }
+    }
+
+    outerCols.push(outer);
+    innerCols.push(inner);
+  }
+
+  if (outerCols.length < 2) return new THREE.BufferGeometry();
+
+  const positions: number[] = [];
+  const n = FILLET_ARC_STEPS + 1;
+  const mc = outerCols.length;
+
+  // Outer skin
+  for (let i = 0; i < mc - 1; i++) {
+    for (let s = 0; s < n - 1; s++) {
+      pushQuad(
+        positions,
+        outerCols[i]![s]!,
+        outerCols[i + 1]![s]!,
+        outerCols[i + 1]![s + 1]!,
+        outerCols[i]![s + 1]!,
+      );
+    }
+  }
+
+  // Inner skin (reversed winding for inward-facing normals)
+  for (let i = 0; i < mc - 1; i++) {
+    for (let s = 0; s < n - 1; s++) {
+      pushQuad(
+        positions,
+        innerCols[i]![s]!,
+        innerCols[i]![s + 1]!,
+        innerCols[i + 1]![s + 1]!,
+        innerCols[i + 1]![s]!,
+      );
+    }
+  }
+
+  // Bottom cap (s = 0 edge, seals visor side)
+  for (let i = 0; i < mc - 1; i++) {
+    pushQuad(
+      positions,
+      outerCols[i]![0]!,
+      innerCols[i]![0]!,
+      innerCols[i + 1]![0]!,
+      outerCols[i + 1]![0]!,
+    );
+  }
+
+  // Top cap (s = n−1 edge, seals crown side)
+  for (let i = 0; i < mc - 1; i++) {
+    pushQuad(
+      positions,
+      outerCols[i]![n - 1]!,
+      outerCols[i + 1]![n - 1]!,
+      innerCols[i + 1]![n - 1]!,
+      innerCols[i]![n - 1]!,
+    );
+  }
+
+  // End caps omitted — taper collapses the cross-section to zero at the tips.
+
+  const geo = new THREE.BufferGeometry();
+  if (positions.length > 0) {
+    geo.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(positions, 3),
+    );
+    geo.computeVertexNormals();
+  }
+  return geo;
+}
+
+// ---------------------------------------------------------------------------
+// Visor tuck: ribbon that extends from the visor's inner rim upward along
+// crown meridians, filling the gap between crown shell and sweatband.
+// ---------------------------------------------------------------------------
+
+/**
+ * Small inward inset so the tuck sits just inside the crown shell,
+ * visible when looking up through the gap below the shifted-down visor.
+ */
+const TUCK_INSET_M = CROWN_SHELL_THICKNESS_M * 0.3;
+const TUCK_RINGS = 10;
+
+/** Move a point toward the z-axis in XY by `dist`. */
+function insetRadialXY(
+  p: [number, number, number],
+  dist: number,
+): [number, number, number] {
+  const L = Math.hypot(p[0], p[1]);
+  if (L < 1e-12) return [p[0], p[1], p[2]];
+  const s = 1 - dist / L;
+  return [p[0] * s, p[1] * s, p[2]];
+}
+
+/**
+ * Tuck ribbon: sits just inside the crown shell over the visor arc, from the
+ * rim (k=0) up to `VISOR_TUCK_HEIGHT_M`. With the visor slab shifted down
+ * beneath the crown, this strip is visible from below through the rim gap.
+ */
+export function buildVisorTuckGeometry(
+  sk: BuiltSkeleton,
+): THREE.BufferGeometry {
+  if (sk.visorPolyline.length < 2) return new THREE.BufferGeometry();
+
+  const spec = sk.spec;
+  const v = spec.visor;
+  const halfSpan = effectiveVisorHalfSpanRad(v, spec.nSeams, sk.angles);
+  const c = v.attachAngleRad;
+  const m = sk.visorPolyline.length;
+  const M = crownArcSegments(spec);
+  const N = crownVerticalRings(spec);
+
+  const cols: [number, number, number][][] = [];
+
+  for (let i = 0; i < m; i++) {
+    const u = i / (m - 1);
+    const theta = c - halfSpan + u * 2 * halfSpan;
+    const kTuck = findKRingForDeltaZ(sk, theta, M, N, VISOR_TUCK_HEIGHT_M);
+
+    const col: [number, number, number][] = [];
+    for (let r = 0; r <= TUCK_RINGS; r++) {
+      const kFloat = (r / TUCK_RINGS) * kTuck;
+      const p = crownMeridianPointAtK(sk, theta, kFloat, M, N);
+      col.push(insetRadialXY(p, TUCK_INSET_M));
+    }
+
+    cols.push(col);
+  }
+
+  const positions: number[] = [];
+  const ringCount = cols[0]!.length;
+
+  for (let i = 0; i < m - 1; i++) {
+    for (let r = 0; r < ringCount - 1; r++) {
+      pushQuad(
+        positions,
+        cols[i]![r]!,
+        cols[i + 1]![r]!,
+        cols[i + 1]![r + 1]!,
+        cols[i]![r + 1]!,
+      );
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  if (positions.length > 0) {
+    geo.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(positions, 3),
+    );
+    geo.computeVertexNormals();
+  }
+  return geo;
 }

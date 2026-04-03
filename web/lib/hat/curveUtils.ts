@@ -245,6 +245,142 @@ export function ribbonGeometryOpen(
 }
 
 /**
+ * Two flat ribbons along the same path with width directions orthogonal in the plane ⊥ tangent.
+ * When one strip is edge-on to the camera, the other usually has non-zero screen thickness (sweatband).
+ */
+export function ribbonGeometryOpenDualOrthogonal(
+  pointsIn: Vec3[],
+  halfWidth: number,
+  normalFn: (p: Vec3) => Vec3,
+): THREE.BufferGeometry {
+  const points = dedupeConsecutivePoints(pointsIn);
+  const n = points.length;
+  if (n < 2) {
+    return new THREE.BufferGeometry();
+  }
+
+  const tangents: Vec3[] = [];
+  for (let i = 0; i < n; i++) {
+    const p = points[i]!;
+    let t: Vec3;
+    if (i === 0) {
+      t = norm3([
+        points[1]![0] - p[0],
+        points[1]![1] - p[1],
+        points[1]![2] - p[2],
+      ]);
+    } else if (i === n - 1) {
+      t = norm3([
+        p[0] - points[i - 1]![0],
+        p[1] - points[i - 1]![1],
+        p[2] - points[i - 1]![2],
+      ]);
+    } else {
+      const t0 = norm3([
+        p[0] - points[i - 1]![0],
+        p[1] - points[i - 1]![1],
+        p[2] - points[i - 1]![2],
+      ]);
+      const t1 = norm3([
+        points[i + 1]![0] - p[0],
+        points[i + 1]![1] - p[1],
+        points[i + 1]![2] - p[2],
+      ]);
+      t = norm3([t0[0] + t1[0], t0[1] + t1[1], t0[2] + t1[2]]);
+    }
+    tangents.push(t);
+  }
+
+  const widths1: Vec3[] = [];
+  const widths2: Vec3[] = [];
+  for (let i = 0; i < n; i++) {
+    const ti = tangents[i]!;
+    const ni = normalFn(points[i]!);
+    let w = cross3(ti, ni);
+    let len = Math.hypot(w[0], w[1], w[2]);
+    if (len < 1e-10) {
+      w = cross3(ti, [0, 0, 1]);
+      len = Math.hypot(w[0], w[1], w[2]);
+    }
+    if (len < 1e-10) {
+      w = [1, 0, 0];
+    } else {
+      w = [w[0] / len, w[1] / len, w[2] / len];
+    }
+    if (i > 0 && dot3(w, widths1[i - 1]!) < 0) {
+      w = [-w[0], -w[1], -w[2]];
+    }
+    widths1.push(w);
+
+    let wO = cross3(ti, w);
+    len = Math.hypot(wO[0], wO[1], wO[2]);
+    if (len < 1e-10) {
+      wO = cross3(ti, [0, 0, 1]);
+      len = Math.hypot(wO[0], wO[1], wO[2]);
+    }
+    if (len < 1e-10) {
+      wO = [1, 0, 0];
+    } else {
+      wO = [wO[0] / len, wO[1] / len, wO[2] / len];
+    }
+    if (i > 0 && dot3(wO, widths2[i - 1]!) < 0) {
+      wO = [-wO[0], -wO[1], -wO[2]];
+    }
+    widths2.push(wO);
+  }
+
+  const positions: number[] = [];
+  const indices: number[] = [];
+  const hw = halfWidth;
+  for (let i = 0; i < n; i++) {
+    const p = points[i]!;
+    const w = widths1[i]!;
+    positions.push(
+      p[0] + w[0] * hw,
+      p[1] + w[1] * hw,
+      p[2] + w[2] * hw,
+      p[0] - w[0] * hw,
+      p[1] - w[1] * hw,
+      p[2] - w[2] * hw,
+    );
+  }
+  const strip2Base = (positions.length / 3) | 0;
+  for (let i = 0; i < n; i++) {
+    const p = points[i]!;
+    const w = widths2[i]!;
+    positions.push(
+      p[0] + w[0] * hw,
+      p[1] + w[1] * hw,
+      p[2] + w[2] * hw,
+      p[0] - w[0] * hw,
+      p[1] - w[1] * hw,
+      p[2] - w[2] * hw,
+    );
+  }
+
+  for (let i = 0; i < n - 1; i++) {
+    const a = i * 2;
+    const b = a + 1;
+    const c = a + 2;
+    const d = a + 3;
+    indices.push(a, b, c, b, d, c);
+  }
+  for (let i = 0; i < n - 1; i++) {
+    const a = strip2Base + i * 2;
+    const b = a + 1;
+    const c = a + 2;
+    const d = a + 3;
+    indices.push(a, b, c, b, d, c);
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+/**
  * Compute cumulative arc-lengths for a polyline.
  * Returns array of length points.length where result[0] = 0.
  */
@@ -352,6 +488,60 @@ export function dashedRibbonGeometry(
 
   for (const dash of dashes) {
     const geo = ribbonGeometryOpen(dash, halfWidth, normalFn);
+    const posAttr = geo.getAttribute("position") as THREE.BufferAttribute | null;
+    const idxAttr = geo.getIndex();
+    if (!posAttr || posAttr.count === 0) {
+      geo.dispose();
+      continue;
+    }
+    const posArr = posAttr.array as Float32Array;
+    for (let i = 0; i < posArr.length; i++) {
+      allPositions.push(posArr[i]!);
+    }
+    if (idxAttr) {
+      const idxArr = idxAttr.array;
+      for (let i = 0; i < idxArr.length; i++) {
+        allIndices.push(idxArr[i]! + vertexOffset);
+      }
+    }
+    vertexOffset += posAttr.count;
+    geo.dispose();
+  }
+
+  if (allPositions.length === 0) return new THREE.BufferGeometry();
+
+  const merged = new THREE.BufferGeometry();
+  merged.setAttribute(
+    "position",
+    new THREE.Float32BufferAttribute(allPositions, 3),
+  );
+  if (allIndices.length > 0) {
+    merged.setIndex(allIndices);
+  }
+  merged.computeVertexNormals();
+  return merged;
+}
+
+/**
+ * Like {@link dashedRibbonGeometry}, but each dash uses {@link ribbonGeometryOpenDualOrthogonal}.
+ */
+export function dashedRibbonGeometryDualOrthogonal(
+  polyline: Vec3[],
+  halfWidth: number,
+  normalFn: (p: Vec3) => Vec3,
+  dashLen: number,
+  gapLen: number,
+  startOffset: number = 0,
+): THREE.BufferGeometry {
+  const dashes = splitPolylineIntoDashes(polyline, dashLen, gapLen, 4, startOffset);
+  if (dashes.length === 0) return new THREE.BufferGeometry();
+
+  const allPositions: number[] = [];
+  const allIndices: number[] = [];
+  let vertexOffset = 0;
+
+  for (const dash of dashes) {
+    const geo = ribbonGeometryOpenDualOrthogonal(dash, halfWidth, normalFn);
     const posAttr = geo.getAttribute("position") as THREE.BufferAttribute | null;
     const idxAttr = geo.getIndex();
     if (!posAttr || posAttr.count === 0) {

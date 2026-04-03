@@ -13,6 +13,7 @@ import * as THREE from "three";
 import { Canvas } from "@react-three/fiber";
 import { OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import { HatModel } from "./HatModel";
+import { DebugThreadingVisibilityLog } from "./DebugThreadingVisibilityLog";
 import {
   defaultHatSkeletonSpec,
   mergeHatSpecDefaults,
@@ -233,6 +234,28 @@ function Panel({
                 </>
               );
             })()}
+          </label>
+          <label style={lab}>
+            Visor shape
+            <select
+              value={v.visorCurvatureM ?? 0}
+              onChange={(e) =>
+                setVisor({ visorCurvatureM: Number(e.target.value) })
+              }
+              style={{
+                padding: "4px 6px",
+                borderRadius: 4,
+                border: "1px solid #374151",
+                background: "#1f2937",
+                color: "#e5e7eb",
+                fontSize: 12,
+              }}
+            >
+              <option value={0}>Flat</option>
+              <option value={0.015}>1.5 cm curve</option>
+              <option value={0.02}>2 cm curve</option>
+              <option value={0.03}>3 cm curve</option>
+            </select>
           </label>
           <label style={lab}>
             Projection
@@ -841,6 +864,7 @@ export function HatViewer() {
             <directionalLight position={[5, 8, 10]} intensity={1.1} />
             <directionalLight position={[-4, 2, -3]} intensity={0.35} />
             <HatModel spec={deferredSpec} measurementHighlight={measurementHighlight} />
+            <DebugThreadingVisibilityLog />
             <OrbitControls makeDefault enableDamping dampingFactor={0.08} />
           </Suspense>
         </Canvas>

@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import {
   buildSkeleton,
+  effectiveVisorHalfSpanRad,
   frontCenterSeamIndex,
   frontGuideAlpha,
   frontGuideArcAndVIndices,
@@ -12,8 +13,8 @@ import {
   type HatSkeletonSpec,
 } from "@/lib/skeleton";
 import {
-  buildCrownGeometry,
   buildCrownPanelGeometries,
+  buildInnerFrontRiseGeometries,
   crownArcSegments,
   crownVerticalRings,
   ruledSurfaceVertexBetweenSeams,
@@ -23,8 +24,18 @@ import {
   subtractBackClosureFromPanels,
   getClosureCutterOutline,
 } from "@/lib/mesh/backClosureSubtract";
-import { buildSweatbandGeometry } from "@/lib/mesh/sweatbandMesh";
-import { buildVisorGeometry, buildVisorTopBottomGeometries } from "@/lib/mesh/visorMesh";
+import {
+  buildSweatbandGeometry,
+  type VisorTuckLiftParams,
+} from "@/lib/mesh/sweatbandMesh";
+import {
+  buildVisorGeometry,
+  buildVisorTopBottomGeometries,
+  buildVisorTuckGeometry,
+  buildVisorFilletGeometry,
+  VISOR_THICKNESS_M,
+  VISOR_TUCK_HEIGHT_M,
+} from "@/lib/mesh/visorMesh";
 import { buildSeamTapeGroup } from "@/lib/hat/seamTapeMesh";
 import { buildThreadingGroup } from "@/lib/hat/threadingMesh";
 
@@ -141,6 +152,41 @@ function buildTopButtonMesh(sk: BuiltSkeleton): THREE.Mesh {
   return mesh;
 }
 
+function visorTuckLiftParams(sk: BuiltSkeleton): VisorTuckLiftParams | undefined {
+  if (sk.visorPolyline.length < 2) return undefined;
+  const spec = sk.spec;
+  const halfSpan = effectiveVisorHalfSpanRad(spec.visor, spec.nSeams, sk.angles);
+  return {
+    thetaCenter: spec.visor.attachAngleRad,
+    halfSpanRad: halfSpan,
+    liftAmount: VISOR_THICKNESS_M,
+    liftHeightM: VISOR_TUCK_HEIGHT_M,
+    blendAngleRad: 0.05,
+  };
+}
+
+/** Inner front rise liner (split from crown shells); drawn before sweatband and seam tape. */
+function buildInnerFrontRiseGroup(sk: BuiltSkeleton): THREE.Group {
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x00f0ff,
+    emissive: 0x003844,
+    emissiveIntensity: 0.35,
+    flatShading: false,
+    side: THREE.DoubleSide,
+    metalness: 0.06,
+    roughness: 0.55,
+  });
+  const geos = buildInnerFrontRiseGeometries(sk);
+  const group = new THREE.Group();
+  group.name = "InnerFrontRise";
+  geos.forEach((geo, i) => {
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.name = `InnerFrontRise_${i}`;
+    group.add(mesh);
+  });
+  return group;
+}
+
 /** Full hat: crown mesh + optional debug guides when `SHOW_HAT_DEBUG_LINES` is true. */
 export function buildHatGroup(sk: BuiltSkeleton): THREE.Group {
   const root = new THREE.Group();
@@ -168,6 +214,7 @@ export function buildHatGroup(sk: BuiltSkeleton): THREE.Group {
     crownGroup.add(mesh);
   });
   root.add(crownGroup);
+  root.add(buildInnerFrontRiseGroup(sk));
   root.add(buildTopButtonMesh(sk));
 
   if (SHOW_HAT_DEBUG_LINES) {
@@ -227,8 +274,10 @@ export function buildHatGroup(sk: BuiltSkeleton): THREE.Group {
     }
   }
 
+  const liftParams = visorTuckLiftParams(sk);
   const sweatbandGeo = buildSweatbandGeometry(sk, {
     closure: sk.spec.backClosureOpening === true,
+    lift: liftParams,
   });
   const sweatband = new THREE.Mesh(
     sweatbandGeo,
@@ -361,15 +410,27 @@ export function buildHatGroup(sk: BuiltSkeleton): THREE.Group {
       metalness: 0.06,
       roughness: 0.55,
     });
-    const { top: visorTopGeo, bottom: visorBotGeo } = buildVisorTopBottomGeometries(sk);
+    const { top: visorTopGeo, bottom: visorBotGeo } = buildVisorTopBottomGeometries(sk, {
+      omitInnerRimInTop: true,
+    });
     const visorGroup = new THREE.Group();
     visorGroup.name = "Visor";
-    const visorTop = new THREE.Mesh(visorTopGeo, visorMat);
-    visorTop.name = "Visor_Top";
-    visorGroup.add(visorTop);
     const visorBot = new THREE.Mesh(visorBotGeo, visorBotMat);
     visorBot.name = "Visor_Bottom";
     visorGroup.add(visorBot);
+    const filletGeo = buildVisorFilletGeometry(sk);
+    const fillet = new THREE.Mesh(filletGeo, visorBotMat);
+    fillet.name = "Visor_Fillet";
+    fillet.renderOrder = 2;
+    visorGroup.add(fillet);
+    const tuckGeo = buildVisorTuckGeometry(sk);
+    const tuck = new THREE.Mesh(tuckGeo, visorBotMat);
+    tuck.name = "Visor_Tuck";
+    tuck.renderOrder = 1;
+    visorGroup.add(tuck);
+    const visorTop = new THREE.Mesh(visorTopGeo, visorMat);
+    visorTop.name = "Visor_Top";
+    visorGroup.add(visorTop);
     root.add(visorGroup);
   }
 
@@ -420,7 +481,7 @@ export function buildHatGroupFromSpec(spec: HatSkeletonSpec): THREE.Group {
 
 /**
  * Export-only group: physical hat parts only (no debug lines or guide wireframes).
- * Hierarchy: Hat → Crown (Panel_0…N), TopButton, Sweatband, SeamTape (…), Visor (Top, Bottom).
+ * Hierarchy: Hat → Crown (Panel_0…N), InnerFrontRise, TopButton, Sweatband, SeamTape (…), Visor (Bottom, Fillet, Tuck, Top).
  */
 export function buildHatExportGroup(spec: HatSkeletonSpec): THREE.Group {
   const sk = buildSkeleton(spec);
@@ -447,10 +508,13 @@ export function buildHatExportGroup(spec: HatSkeletonSpec): THREE.Group {
     crownGroup.add(mesh);
   });
   root.add(crownGroup);
+  root.add(buildInnerFrontRiseGroup(sk));
   root.add(buildTopButtonMesh(sk));
 
+  const exportLiftParams = visorTuckLiftParams(sk);
   const sweatbandGeo = buildSweatbandGeometry(sk, {
     closure: sk.spec.backClosureOpening === true,
+    lift: exportLiftParams,
   });
   const sweatband = new THREE.Mesh(
     sweatbandGeo,
@@ -485,15 +549,27 @@ export function buildHatExportGroup(spec: HatSkeletonSpec): THREE.Group {
       metalness: 0.06,
       roughness: 0.55,
     });
-    const { top: visorTopGeo, bottom: visorBotGeo } = buildVisorTopBottomGeometries(sk);
+    const { top: visorTopGeo, bottom: visorBotGeo } = buildVisorTopBottomGeometries(sk, {
+      omitInnerRimInTop: true,
+    });
     const visorGroup = new THREE.Group();
     visorGroup.name = "Visor";
-    const visorTop = new THREE.Mesh(visorTopGeo, visorMat);
-    visorTop.name = "Visor_Top";
-    visorGroup.add(visorTop);
     const visorBot = new THREE.Mesh(visorBotGeo, visorBotMat);
     visorBot.name = "Visor_Bottom";
     visorGroup.add(visorBot);
+    const filletGeo = buildVisorFilletGeometry(sk);
+    const fillet = new THREE.Mesh(filletGeo, visorBotMat);
+    fillet.name = "Visor_Fillet";
+    fillet.renderOrder = 2;
+    visorGroup.add(fillet);
+    const tuckGeo = buildVisorTuckGeometry(sk);
+    const tuck = new THREE.Mesh(tuckGeo, visorBotMat);
+    tuck.name = "Visor_Tuck";
+    tuck.renderOrder = 1;
+    visorGroup.add(tuck);
+    const visorTop = new THREE.Mesh(visorTopGeo, visorMat);
+    visorTop.name = "Visor_Top";
+    visorGroup.add(visorTop);
     root.add(visorGroup);
   }
 

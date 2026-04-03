@@ -22,6 +22,11 @@ export interface VisorSpec {
   mode: VisorMode;
   superellipseN: number;
   samples: number;
+  /**
+   * Upward curvature of the visor outer edge (metres). 0 = flat brim.
+   * Maximum at span center and zero at the tips (sine bell), increasing toward the outer edge.
+   */
+  visorCurvatureM: number;
 }
 
 /** Only five- and six-panel crowns are supported; seam angles follow cap conventions (see `panelSeamAngles`). */
@@ -191,6 +196,7 @@ export const defaultVisorSpec = (): VisorSpec => ({
   mode: "superellipse",
   superellipseN: 3,
   samples: 48,
+  visorCurvatureM: 0,
 });
 
 export const defaultHatSkeletonSpec = (): HatSkeletonSpec => ({
@@ -265,6 +271,10 @@ export function validateSpec(spec: HatSkeletonSpec): void {
   }
   if ((spec.visor.rimOutsetBeyondSeamRad ?? 0.035) < 0) {
     throw new Error("rimOutsetBeyondSeamRad must be >= 0");
+  }
+  const curv = spec.visor.visorCurvatureM ?? 0;
+  if (curv < 0 || curv > 0.04) {
+    throw new Error("visorCurvatureM must be in [0, 0.04]");
   }
   if (
     spec.fivePanelCenterSeamLength < 0 ||

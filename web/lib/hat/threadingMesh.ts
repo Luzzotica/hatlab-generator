@@ -23,13 +23,20 @@ import {
   sampleSeamWireframeToWithGroove,
 } from "@/lib/mesh/crownMesh";
 import {
+  outerSurfacePoint,
+  offsetInwardXY,
   rimWorldXYToSweatbandTheta,
   sweatbandFrontArcStartAndSpan,
   SWEATBAND_HEIGHT_M,
   SWEATBAND_OUTER_INSET_M,
   SWEATBAND_THICKNESS_M,
 } from "@/lib/mesh/sweatbandMesh";
-import { VISOR_THICKNESS_M } from "@/lib/mesh/visorMesh";
+import {
+  applyVisorSlabXYOnly,
+  visorOuterCurvatureZLocal,
+  VISOR_THICKNESS_M,
+  VISOR_Z_BASE,
+} from "@/lib/mesh/visorMesh";
 import { SEAM_TAPE_WIDTH_M } from "@/lib/hat/seamTapeMesh";
 import {
   type Vec3,
@@ -41,6 +48,7 @@ import {
   sampleOpenArchPath,
   segmentPolylineExcludingStadium,
   dashedRibbonGeometry,
+  dashedRibbonGeometryDualOrthogonal,
   cumulativeArcLengths,
   interpolatePolylineAtArcLength,
 } from "@/lib/hat/curveUtils";
@@ -93,6 +101,17 @@ const SWEATBAND_THREAD_SEGMENTS = 96;
 
 /** Base threading: vertical offset above z=0. */
 const BASE_THREAD_Z_OFFSET_M = 0.001;
+
+/**
+ * TEMP visibility check: large inward move (toward the hat axis) from the sweatband outer
+ * surface — several times band thickness + 15 mm so stitches sit well inside the cavity toward
+ * the head and in front of the sweatband mesh in depth. Tune back down for production.
+ */
+const THREAD_SWEATBAND_DEPTH_BIAS_INWARD_M =
+  SWEATBAND_THICKNESS_M * 4 + 0.015;
+
+/** TEMP: ~5 mm half-width so dashes are obvious while verifying placement. */
+const SWEATBAND_THREAD_HALF_WIDTH_M = 0.005;
 
 function crownNormalFn(spec: HatSkeletonSpec) {
   return (p: Vec3) => outwardCrownNormalApprox(p, spec);
@@ -435,6 +454,41 @@ function clipPolylineToOutsideRim(
   return out;
 }
 
+/**
+ * Interpolate visor outer-edge curvature Z for a 2D point by closest projection onto `polyline` segments.
+ */
+function curvatureZAtXYOnPolyline(
+  polyline: [number, number, number][],
+  droopZ: number[],
+  px: number,
+  py: number,
+): number {
+  if (polyline.length === 0 || droopZ.length !== polyline.length) return 0;
+  if (polyline.length === 1) return droopZ[0]!;
+  let bestZ = droopZ[0]!;
+  let bestDist = Infinity;
+  for (let i = 0; i < polyline.length - 1; i++) {
+    const ax = polyline[i]![0];
+    const ay = polyline[i]![1];
+    const bx = polyline[i + 1]![0];
+    const by = polyline[i + 1]![1];
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    let t =
+      len2 < 1e-24 ? 0 : ((px - ax) * dx + (py - ay) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const qx = ax + t * dx;
+    const qy = ay + t * dy;
+    const dist = (px - qx) ** 2 + (py - qy) ** 2;
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestZ = droopZ[i]! * (1 - t) + droopZ[i + 1]! * t;
+    }
+  }
+  return bestZ;
+}
+
 function buildVisorThreading(
   sk: BuiltSkeleton,
   mat: THREE.Material,
@@ -448,8 +502,9 @@ function buildVisorThreading(
   const visorSpec = { ...v, halfSpanRad: halfSpan };
   const m = sk.visorPolyline.length;
 
-  const topZ = VISOR_THICKNESS_M + VISOR_THREAD_Z_OFFSET_M;
-  const botZ = -VISOR_THREAD_Z_OFFSET_M;
+  const baseTopZ = VISOR_Z_BASE + VISOR_THICKNESS_M + VISOR_THREAD_Z_OFFSET_M;
+  const baseBotZ = VISOR_Z_BASE - VISOR_THREAD_Z_OFFSET_M;
+  const droopZ = visorOuterCurvatureZLocal(sk);
 
   const threadPeriod = THREAD_DASH_M + THREAD_GAP_M;
   const staggerTrim = threadPeriod * 0.5;
@@ -487,8 +542,18 @@ function buildVisorThreading(
 
     const isOddRow = row % 2 === 1;
 
-    let topRow = clipped.map((p) => [p[0], p[1], topZ] as Vec3);
-    let botRow = clipped.map((p) => [p[0], p[1], botZ] as Vec3);
+    const droopZRow = droopZ.map((z) => z * scaleK);
+
+    let topRow = clipped.map((p) => {
+      const dz = curvatureZAtXYOnPolyline(rawPts, droopZRow, p[0], p[1]);
+      const [x, y] = applyVisorSlabXYOnly([p[0], p[1], 0]);
+      return [x, y, baseTopZ + dz] as Vec3;
+    });
+    let botRow = clipped.map((p) => {
+      const dz = curvatureZAtXYOnPolyline(rawPts, droopZRow, p[0], p[1]);
+      const [x, y] = applyVisorSlabXYOnly([p[0], p[1], 0]);
+      return [x, y, baseBotZ + dz] as Vec3;
+    });
 
     if (isOddRow) {
       topRow = trimPolylineStart(topRow, staggerTrim);
@@ -575,7 +640,6 @@ function buildSweatbandThreading(
   const M = crownArcSegments(spec);
   const N = crownVerticalRings(spec);
   const inset = SWEATBAND_OUTER_INSET_M;
-  const thickness = SWEATBAND_THICKNESS_M;
   const closure = spec.backClosureOpening === true;
 
   let thetas: number[];
@@ -610,6 +674,12 @@ function buildSweatbandThreading(
     thetas = Array.from({ length: nSeg }, (_, i) => (i / nSeg) * 2 * Math.PI);
   }
 
+  const sweatMat = (mat as THREE.MeshStandardMaterial).clone();
+  sweatMat.color.setHex(0x00ffcc);
+  sweatMat.emissive = new THREE.Color(0x00aa88);
+  sweatMat.emissiveIntensity = 0.55;
+  sweatMat.depthWrite = false;
+
   for (let row = 0; row < SWEATBAND_ROW_FRACTIONS.length; row++) {
     const hFrac = SWEATBAND_ROW_FRACTIONS[row]!;
     const dz = SWEATBAND_HEIGHT_M * hFrac;
@@ -617,14 +687,13 @@ function buildSweatbandThreading(
     const rowPoints: Vec3[] = [];
     for (const theta of thetas) {
       const kFloat = findKRingForDeltaZ(sk, theta, M, N, Math.max(dz, 1e-10));
-      const cp = crownMeridianPointAtK(sk, theta, kFloat, M, N);
-      const rho = Math.hypot(cp[0], cp[1]);
-      if (rho < 1e-12) {
-        rowPoints.push(cp as Vec3);
-        continue;
-      }
-      const s = (inset - thickness * 0.5) / rho;
-      rowPoints.push([cp[0] - cp[0] * s, cp[1] - cp[1] * s, cp[2]]);
+      // Outer sweatband surface (faces the hat interior), not mid-thickness inside the solid.
+      const onOuter = outerSurfacePoint(sk, theta, kFloat, M, N, inset);
+      const p = offsetInwardXY(
+        onOuter,
+        THREAD_SWEATBAND_DEPTH_BIAS_INWARD_M,
+      ) as Vec3;
+      rowPoints.push(p);
     }
 
     if (!openArc && rowPoints.length > 1) {
@@ -632,13 +701,64 @@ function buildSweatbandThreading(
     }
 
     const nFn = crownNormalFn(spec);
-    const geo = dashedRibbonGeometry(rowPoints, THREAD_HALF_WIDTH_M, nFn, THREAD_DASH_M, THREAD_GAP_M);
+    const geo = dashedRibbonGeometryDualOrthogonal(
+      rowPoints,
+      SWEATBAND_THREAD_HALF_WIDTH_M / Math.SQRT2,
+      nFn,
+      THREAD_DASH_M,
+      THREAD_GAP_M,
+    );
     if (geo.getAttribute("position")) {
-      const mesh = new THREE.Mesh(geo, mat);
+      const mesh = new THREE.Mesh(geo, sweatMat);
       mesh.name = `Thread_Sweatband_${row}`;
+      mesh.renderOrder = 8;
       group.add(mesh);
     }
   }
+
+  // #region agent log
+  {
+    let totalVerts = 0;
+    let meshCount = 0;
+    const names: string[] = [];
+    group.traverse((o) => {
+      if (
+        o.name.startsWith("Thread_Sweatband_") &&
+        o instanceof THREE.Mesh
+      ) {
+        meshCount += 1;
+        names.push(o.name);
+        const attr = o.geometry.getAttribute("position");
+        if (attr) totalVerts += attr.count;
+      }
+    });
+    fetch(
+      "http://127.0.0.1:7308/ingest/f207d8e5-31a4-4fc3-90ad-c0892d7b6fa9",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Debug-Session-Id": "7b9aa0",
+        },
+        body: JSON.stringify({
+          sessionId: "7b9aa0",
+          location: "threadingMesh.ts:buildSweatbandThreading",
+          message: "sweatband thread geometry summary",
+          data: {
+            hypothesisId: "H5",
+            runId: "post-fix",
+            totalVerts,
+            meshCount,
+            names,
+            biasInwardM: THREAD_SWEATBAND_DEPTH_BIAS_INWARD_M,
+            halfWidthM: SWEATBAND_THREAD_HALF_WIDTH_M,
+          },
+          timestamp: Date.now(),
+        }),
+      },
+    ).catch(() => {});
+  }
+  // #endregion
 }
 
 // ---------------------------------------------------------------------------

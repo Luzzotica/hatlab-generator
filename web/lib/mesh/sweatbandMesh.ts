@@ -120,8 +120,8 @@ export function sweatbandFrontArcStartAndSpan(
   return { start: L, span: dCcw };
 }
 
-/** Move p toward z-axis in XY by dist (inward). */
-function offsetInwardXY(
+/** Move p toward z-axis in XY by dist (inward). Negative dist pushes outward. */
+export function offsetInwardXY(
   p: [number, number, number],
   dist: number,
 ): [number, number, number] {
@@ -134,7 +134,7 @@ function offsetInwardXY(
 /**
  * Crown point on meridian θ at k, then inset toward the head (inside outer shell).
  */
-function outerSurfacePoint(
+export function outerSurfacePoint(
   sk: BuiltSkeleton,
   theta: number,
   kFloat: number,
@@ -178,7 +178,7 @@ function filletArcFromCorner(
 }
 
 /** One θ column: outer points per ring (bottom → top), following the crown meridian + fillets. */
-function buildOuterColumn(
+export function buildOuterColumn(
   sk: BuiltSkeleton,
   theta: number,
   M: number,
@@ -229,9 +229,36 @@ function buildOuterColumn(
   return { outer, inner };
 }
 
+/** Parameters describing how the sweatband bulges outward where the visor tucks underneath. */
+export interface VisorTuckLiftParams {
+  thetaCenter: number;
+  halfSpanRad: number;
+  liftAmount: number;
+  liftHeightM: number;
+  blendAngleRad: number;
+}
+
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
+
+function visorLiftAlpha(theta: number, lift: VisorTuckLiftParams): number {
+  let d = theta - lift.thetaCenter;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  const dist = Math.abs(d);
+  if (dist >= lift.halfSpanRad) return 0;
+  const innerEdge = lift.halfSpanRad - lift.blendAngleRad;
+  if (dist <= innerEdge) return 1;
+  return 1 - smoothstep(innerEdge, lift.halfSpanRad, dist);
+}
+
 export type SweatbandGeometryOptions = {
   /** When true, mesh only the front arc between closure rails (no CSG). */
   closure?: boolean;
+  /** When provided, bulge the sweatband outward in the visor tuck region. */
+  lift?: VisorTuckLiftParams;
 };
 
 /**
@@ -309,6 +336,24 @@ export function buildSweatbandGeometry(
 
   if (ringCount < 2) {
     return new THREE.BufferGeometry();
+  }
+
+  const lift = options.lift;
+  if (lift && lift.liftAmount > 1e-8) {
+    for (let i = 0; i < nSeg; i++) {
+      const theta = thetas[i]!;
+      const alpha = visorLiftAlpha(theta, lift);
+      if (alpha < 1e-8) continue;
+      for (let r = 0; r < ringCount; r++) {
+        const op = outerCols[i]![r]!;
+        const beta = Math.max(0, 1 - op[2] / lift.liftHeightM);
+        const push = lift.liftAmount * alpha * beta;
+        if (push < 1e-8) continue;
+        // Positive dist moves toward the axis (smaller XY radius), away from the crown outer shell.
+        outerCols[i]![r] = offsetInwardXY(op, push);
+        innerCols[i]![r] = offsetInwardXY(outerCols[i]![r]!, thickness);
+      }
+    }
   }
 
   const positions: number[] = [];

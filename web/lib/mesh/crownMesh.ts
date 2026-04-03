@@ -9,6 +9,7 @@ import {
   frontCenterSeamIndex,
   frontGuideAlpha,
   frontGuideArcAndVIndices,
+  frontRisePanelIndices,
   seamQuadraticBezier,
   effectiveSquarenessForSeam,
   solveSquarenessForArcLengthMultiplier,
@@ -452,6 +453,102 @@ export function samplePanelMeridian(
   return pts;
 }
 
+function crownMeshResolution(sk: BuiltSkeleton): {
+  M: number;
+  N: number;
+  collapseTop: boolean;
+} {
+  const N = crownVerticalRings(sk.spec);
+  const M_logic = crownArcSegments(sk.spec);
+  const n = sk.spec.nSeams;
+  let maxPanelChord = 0;
+  for (let i = 0; i < n; i++) {
+    const a = sk.rimPoints[i]!;
+    const b = sk.rimPoints[(i + 1) % n]!;
+    maxPanelChord = Math.max(maxPanelChord, Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]));
+  }
+  const M = Math.max(M_logic, Math.ceil(maxPanelChord / CROWN_MAX_ARC_SEGMENT_M));
+  const collapseTop = (sk.spec.topRimFraction ?? 0) <= 1e-12;
+  return { M, N, collapseTop };
+}
+
+function computePanelOuterInnerGrids(
+  sk: BuiltSkeleton,
+  panel: number,
+  M: number,
+  N: number
+): {
+  outer: [number, number, number][][];
+  inner: [number, number, number][][];
+} {
+  const t = CROWN_SHELL_THICKNESS_M;
+  const outer: [number, number, number][][] = new Array(M + 1);
+  for (let j = 0; j <= M; j++) {
+    outer[j] = new Array(N + 1);
+    for (let k = 0; k <= N; k++) {
+      outer[j]![k] = panelVertex(sk, panel, j, k, M, N);
+    }
+  }
+
+  const normals: [number, number, number][][] = new Array(M + 1);
+  for (let j = 0; j <= M; j++) {
+    normals[j] = new Array(N + 1);
+    for (let k = 0; k <= N; k++) {
+      const pjL = outer[j > 0 ? j - 1 : j]![k]!;
+      const pjR = outer[j < M ? j + 1 : j]![k]!;
+      const pkL = outer[j]![k > 0 ? k - 1 : k]!;
+      const pkR = outer[j]![k < N ? k + 1 : k]!;
+      const du = sub3(pjR, pjL);
+      const dv = sub3(pkR, pkL);
+      let nm = cross3(du, dv);
+      let len = Math.hypot(nm[0], nm[1], nm[2]);
+      if (len < 1e-12) {
+        const p = outer[j]![k]!;
+        const r = Math.hypot(p[0], p[1]);
+        nm = r < 1e-12 ? [0, 0, 1] : [p[0] / r, p[1] / r, 0];
+        len = 1;
+      }
+      normals[j]![k] = [nm[0] / len, nm[1] / len, nm[2] / len];
+    }
+  }
+
+  const inner: [number, number, number][][] = new Array(M + 1);
+  for (let j = 0; j <= M; j++) {
+    inner[j] = new Array(N + 1);
+    for (let k = 0; k <= N; k++) {
+      const p = outer[j]![k]!;
+      const nm = normals[j]![k]!;
+      inner[j]![k] = [p[0] - t * nm[0], p[1] - t * nm[1], p[2] - t * nm[2]];
+    }
+  }
+
+  return { outer, inner };
+}
+
+function pushInnerSurfaceQuads(
+  positions: number[],
+  inner: [number, number, number][][],
+  M: number,
+  N: number,
+  collapseTop: boolean
+): void {
+  for (let k = 0; k < N; k++) {
+    const lastStrip = k === N - 1;
+    for (let j = 0; j < M; j++) {
+      const i00 = inner[j]![k]!;
+      const i10 = inner[j + 1]![k]!;
+      const i01 = inner[j]![k + 1]!;
+      const i11 = inner[j + 1]![k + 1]!;
+      if (!lastStrip || !collapseTop) {
+        pushTriangle(positions, i00, i01, i10);
+        pushTriangle(positions, i10, i01, i11);
+      } else {
+        pushTriangle(positions, i00, i01, i10);
+      }
+    }
+  }
+}
+
 /**
  * Crown: bottom follows the sweatband ellipse per panel; edges use seam curves (Bézier or split);
  * interior uses matching quadratic bulges. Outer + inner surfaces plus rim/top edge walls
@@ -459,9 +556,15 @@ export function samplePanelMeridian(
  */
 export function buildCrownGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
   const geos = buildCrownPanelGeometries(sk);
+  const innerFront = buildInnerFrontRiseGeometries(sk);
   const merged = new THREE.BufferGeometry();
   const allPositions: number[] = [];
   for (const g of geos) {
+    const attr = g.getAttribute("position") as THREE.BufferAttribute;
+    for (let i = 0; i < attr.count * 3; i++) allPositions.push(attr.array[i]!);
+    g.dispose();
+  }
+  for (const g of innerFront) {
     const attr = g.getAttribute("position") as THREE.BufferAttribute;
     for (let i = 0; i < attr.count * 3; i++) allPositions.push(attr.array[i]!);
     g.dispose();
@@ -471,66 +574,37 @@ export function buildCrownGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
   return merged;
 }
 
-/** One BufferGeometry per crown panel (outer + inner shell, rim wall, top wall). */
+/**
+ * Inner fabric surface only for front rise panels (split from main crown shells for separate materials).
+ */
+export function buildInnerFrontRiseGeometries(sk: BuiltSkeleton): THREE.BufferGeometry[] {
+  const { M, N, collapseTop } = crownMeshResolution(sk);
+  const geos: THREE.BufferGeometry[] = [];
+  for (const panel of frontRisePanelIndices(sk.spec.nSeams)) {
+    const { inner } = computePanelOuterInnerGrids(sk, panel, M, N);
+    const positions: number[] = [];
+    pushInnerSurfaceQuads(positions, inner, M, N, collapseTop);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geo.computeVertexNormals();
+    geos.push(geo);
+  }
+  return geos;
+}
+
+/**
+ * One BufferGeometry per crown panel (outer + inner shell, rim wall, top wall).
+ * Front rise panels omit the inner shell from this mesh; use {@link buildInnerFrontRiseGeometries}.
+ */
 export function buildCrownPanelGeometries(sk: BuiltSkeleton): THREE.BufferGeometry[] {
   const n = sk.spec.nSeams;
-  const N = crownVerticalRings(sk.spec);
-  const M_logic = crownArcSegments(sk.spec);
-
-  let maxPanelChord = 0;
-  for (let i = 0; i < n; i++) {
-    const a = sk.rimPoints[i]!;
-    const b = sk.rimPoints[(i + 1) % n]!;
-    maxPanelChord = Math.max(maxPanelChord, Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]));
-  }
-  const M = Math.max(M_logic, Math.ceil(maxPanelChord / CROWN_MAX_ARC_SEGMENT_M));
-
-  const collapseTop = (sk.spec.topRimFraction ?? 0) <= 1e-12;
-  const t = CROWN_SHELL_THICKNESS_M;
+  const { M, N, collapseTop } = crownMeshResolution(sk);
+  const frontRise = new Set(frontRisePanelIndices(sk.spec.nSeams));
   const geos: THREE.BufferGeometry[] = [];
 
   for (let panel = 0; panel < n; panel++) {
     const positions: number[] = [];
-
-    const outer: [number, number, number][][] = new Array(M + 1);
-    for (let j = 0; j <= M; j++) {
-      outer[j] = new Array(N + 1);
-      for (let k = 0; k <= N; k++) {
-        outer[j]![k] = panelVertex(sk, panel, j, k, M, N);
-      }
-    }
-
-    const normals: [number, number, number][][] = new Array(M + 1);
-    for (let j = 0; j <= M; j++) {
-      normals[j] = new Array(N + 1);
-      for (let k = 0; k <= N; k++) {
-        const pjL = outer[j > 0 ? j - 1 : j]![k]!;
-        const pjR = outer[j < M ? j + 1 : j]![k]!;
-        const pkL = outer[j]![k > 0 ? k - 1 : k]!;
-        const pkR = outer[j]![k < N ? k + 1 : k]!;
-        const du = sub3(pjR, pjL);
-        const dv = sub3(pkR, pkL);
-        let nm = cross3(du, dv);
-        let len = Math.hypot(nm[0], nm[1], nm[2]);
-        if (len < 1e-12) {
-          const p = outer[j]![k]!;
-          const r = Math.hypot(p[0], p[1]);
-          nm = r < 1e-12 ? [0, 0, 1] : [p[0] / r, p[1] / r, 0];
-          len = 1;
-        }
-        normals[j]![k] = [nm[0] / len, nm[1] / len, nm[2] / len];
-      }
-    }
-
-    const inner: [number, number, number][][] = new Array(M + 1);
-    for (let j = 0; j <= M; j++) {
-      inner[j] = new Array(N + 1);
-      for (let k = 0; k <= N; k++) {
-        const p = outer[j]![k]!;
-        const nm = normals[j]![k]!;
-        inner[j]![k] = [p[0] - t * nm[0], p[1] - t * nm[1], p[2] - t * nm[2]];
-      }
-    }
+    const { outer, inner } = computePanelOuterInnerGrids(sk, panel, M, N);
 
     for (let k = 0; k < N; k++) {
       const lastStrip = k === N - 1;
@@ -548,20 +622,8 @@ export function buildCrownPanelGeometries(sk: BuiltSkeleton): THREE.BufferGeomet
       }
     }
 
-    for (let k = 0; k < N; k++) {
-      const lastStrip = k === N - 1;
-      for (let j = 0; j < M; j++) {
-        const i00 = inner[j]![k]!;
-        const i10 = inner[j + 1]![k]!;
-        const i01 = inner[j]![k + 1]!;
-        const i11 = inner[j + 1]![k + 1]!;
-        if (!lastStrip || !collapseTop) {
-          pushTriangle(positions, i00, i01, i10);
-          pushTriangle(positions, i10, i01, i11);
-        } else {
-          pushTriangle(positions, i00, i01, i10);
-        }
-      }
+    if (!frontRise.has(panel)) {
+      pushInnerSurfaceQuads(positions, inner, M, N, collapseTop);
     }
 
     for (let j = 0; j < M; j++) {

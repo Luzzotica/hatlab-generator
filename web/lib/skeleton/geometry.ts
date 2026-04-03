@@ -223,6 +223,14 @@ export function frontPanelRimThetaBounds(
 }
 
 /**
+ * Crown panel indices for the front rise (visor-facing region). Matches
+ * {@link frontPanelRimThetaBounds}: 5-panel → one panel `[0]`; 6-panel → two panels `[0, 1]`.
+ */
+export function frontRisePanelIndices(nSeams: PanelCount): number[] {
+  return nSeams === 5 ? [0] : [0, 1];
+}
+
+/**
  * Half-angle span (rad) for visor attach: min of user `halfSpanRad` and the front-panel
  * seam window, widened by `rimOutsetBeyondSeamRad` (past the side seams) and narrowed by
  * `rimInsetBehindSeamRad`.
