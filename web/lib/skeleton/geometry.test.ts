@@ -8,6 +8,7 @@ import {
   seamQuadraticBezier,
   panelSeamAngles,
   frontPanelRimThetaBounds,
+  eyeletPanelIndices,
   effectiveVisorHalfSpanRad,
   visorOuterPolyline,
   sampleVisorSuperellipsePolyline,
@@ -30,7 +31,12 @@ import {
 } from "./geometry";
 import { measurementTargetsFromSpec, seamGroupIndices } from "./measurements";
 import { solveHatSpecFromMeasurements } from "./solveMeasurements";
-import { defaultHatSkeletonSpec, defaultVisorSpec, mergeHatSpecDefaults } from "./types";
+import {
+  defaultHatSkeletonSpec,
+  defaultVisorSpec,
+  mergeHatSpecDefaults,
+  type HatSkeletonSpec,
+} from "./types";
 
 describe("topRimPoint", () => {
   it("lies on z = crownHeight and scales ellipse by fraction", () => {
@@ -100,6 +106,49 @@ describe("panelSeamAngles", () => {
     expect(a.length).toBe(6);
     const hit = Array.from(a).some((x) => Math.abs(x - 0.5 * Math.PI) < 1e-9);
     expect(hit).toBe(true);
+  });
+});
+
+describe("eyeletPanelIndices", () => {
+  it("6-panel mode (crownPanelMode 6): all panels", () => {
+    const spec: HatSkeletonSpec = {
+      ...defaultHatSkeletonSpec(),
+      nSeams: 6,
+      crownPanelMode: 6,
+      fivePanelCenterSeamLength: 1.0,
+    };
+    expect(eyeletPanelIndices(spec)).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
+  it("5-panel mode (crownPanelMode 5, nSeams still 6): four panels, skip front 0", () => {
+    const spec: HatSkeletonSpec = {
+      ...defaultHatSkeletonSpec(),
+      nSeams: 6,
+      crownPanelMode: 5,
+      fivePanelCenterSeamLength: 0.36,
+    };
+    expect(eyeletPanelIndices(spec)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("native nSeams 5: four panels, skip front 0", () => {
+    const spec: HatSkeletonSpec = {
+      ...defaultHatSkeletonSpec(),
+      nSeams: 5,
+      crownPanelMode: 6,
+      fivePanelCenterSeamLength: 1.0,
+    };
+    expect(eyeletPanelIndices(spec)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("mergeHatSpecDefaults infers crownPanelMode 5 from center seam when omitted", () => {
+    const d = defaultHatSkeletonSpec();
+    const { crownPanelMode: _omit, ...withoutMode } = d;
+    const merged = mergeHatSpecDefaults({
+      ...withoutMode,
+      fivePanelCenterSeamLength: 0.36,
+    } as HatSkeletonSpec);
+    expect(merged.crownPanelMode).toBe(5);
+    expect(eyeletPanelIndices(merged)).toEqual([1, 2, 3, 4]);
   });
 });
 

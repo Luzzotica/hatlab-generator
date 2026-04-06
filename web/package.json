@@ -16,9 +16,7 @@
     "next": "15.5.14",
     "react": "19.1.0",
     "react-dom": "19.1.0",
-    "three": "^0.183.2",
-    "three-bvh-csg": "^0.0.18",
-    "three-mesh-bvh": "^0.9.9"
+    "three": "^0.183.2"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",

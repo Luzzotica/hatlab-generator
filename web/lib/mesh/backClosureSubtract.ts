@@ -1,7 +1,6 @@
 import * as THREE from "three";
-import { mergeVertices } from "three/examples/jsm/utils/BufferGeometryUtils.js";
-import { Brush, Evaluator, HOLLOW_SUBTRACTION } from "three-bvh-csg";
 import type { BuiltSkeleton } from "@/lib/skeleton/geometry";
+import type { PanelCount } from "@/lib/skeleton/types";
 import {
   evalSeamCurve,
   rearCenterSeamIndex,
@@ -20,13 +19,6 @@ export const BACK_CLOSURE_STRAIGHT_EDGE_M = 0.025;
 /** Overall height = {@link BACK_CLOSURE_STRAIGHT_EDGE_M} + width/2 (semicircle on top). */
 export const BACK_CLOSURE_TOTAL_HEIGHT_M =
   BACK_CLOSURE_STRAIGHT_EDGE_M + BACK_CLOSURE_WIDTH_M * 0.5;
-
-/**
- * Thin slab along +surface normal only — must not extend deep into the interior or CSG
- * removes the front of the shell too. Straddles the outer surface with a small inward bias.
- */
-const CLOSURE_CUT_DEPTH_M = 0.08;
-const CLOSURE_CUT_INWARD_BIAS_M = 0.04;
 
 /**
  * Move the opening toward the brim along −tH (from seam rim toward band). The seam sample at u=0
@@ -164,26 +156,75 @@ export function getBackClosureOpeningFrame(sk: BuiltSkeleton): {
   return { tW, tH, n, rimAnchor };
 }
 
-function applyClosureBasisToGeometry(
-  geo: THREE.BufferGeometry,
-  tW: [number, number, number],
-  tH: [number, number, number],
-  n: [number, number, number],
-  rimCenter: [number, number, number],
-): void {
-  const basis = new THREE.Matrix4();
-  basis.makeBasis(
-    new THREE.Vector3(tW[0], tW[1], tW[2]),
-    new THREE.Vector3(tH[0], tH[1], tH[2]),
-    new THREE.Vector3(n[0], n[1], n[2]),
-  );
-  const pos = new THREE.Matrix4().makeTranslation(
-    rimCenter[0],
-    rimCenter[1],
-    rimCenter[2],
-  );
-  const transform = new THREE.Matrix4().multiplyMatrices(pos, basis);
-  geo.applyMatrix4(transform);
+/** Width / straight leg used for mesh cutout and tape (matches former CSG cutter). */
+export function getClosureCutterDimensions(): {
+  widthM: number;
+  straightM: number;
+} {
+  return {
+    widthM: BACK_CLOSURE_WIDTH_M + BACK_CLOSURE_TAPE_MARGIN_M,
+    straightM: BACK_CLOSURE_STRAIGHT_EDGE_M + BACK_CLOSURE_TAPE_MARGIN_M,
+  };
+}
+
+export function closureLocalWH(
+  p: readonly [number, number, number],
+  rimAnchor: readonly [number, number, number],
+  tW: readonly [number, number, number],
+  tH: readonly [number, number, number],
+): { lw: number; lh: number } {
+  const dx = p[0] - rimAnchor[0];
+  const dy = p[1] - rimAnchor[1];
+  const dz = p[2] - rimAnchor[2];
+  return {
+    lw: dx * tW[0] + dy * tW[1] + dz * tW[2],
+    lh: dx * tH[0] + dy * tH[1] + dz * tH[2],
+  };
+}
+
+/**
+ * True if (lw,lh) lies inside the closed stadium: flat bottom on lh=0, vertical sides, semicircular top.
+ * Same metric space as {@link buildStadiumShape}.
+ */
+export function pointInsideStadiumOpening2D(
+  lw: number,
+  lh: number,
+  widthM: number,
+  straightM: number,
+): boolean {
+  const halfW = widthM * 0.5;
+  const h = straightM;
+  const R = halfW;
+  if (lh < -1e-8) return false;
+  if (lh <= h + 1e-8) return Math.abs(lw) <= halfW + 1e-8;
+  const dy = lh - h;
+  return lw * lw + dy * dy <= R * R + 1e-8;
+}
+
+/**
+ * Closed stadium outline in opening 2D (lw,lh), CCW when viewed from +surface normal n.
+ * First point repeats at end for convenience.
+ */
+export function sampleStadiumBoundary2DClosed(
+  widthM: number,
+  straightM: number,
+  pointsPerEdge: number,
+): [number, number][] {
+  const shape = buildStadiumShape(widthM, straightM);
+  const n = Math.max(8, pointsPerEdge);
+  const pts2d = shape.getPoints(n);
+  const out: [number, number][] = [];
+  for (const v of pts2d) {
+    out.push([v.x, v.y]);
+  }
+  if (out.length > 0) {
+    const f = out[0]!;
+    const l = out[out.length - 1]!;
+    if (Math.hypot(f[0] - l[0], f[1] - l[1]) > 1e-6) {
+      out.push([f[0], f[1]]);
+    }
+  }
+  return out;
 }
 
 /**
@@ -224,27 +265,16 @@ export function buildStadiumHolePath(
   return hole;
 }
 
-function buildClosureCutterGeometry(
-  widthM: number,
-  straightM: number,
-  depthM: number,
-  inwardBiasM: number,
-  tW: [number, number, number],
-  tH: [number, number, number],
-  n: [number, number, number],
-  rimCenter: [number, number, number],
-): THREE.BufferGeometry {
-  const shape = buildStadiumShape(widthM, straightM);
-
-  const geo = new THREE.ExtrudeGeometry(shape, {
-    depth: depthM,
-    bevelEnabled: false,
-    steps: 1,
-  });
-  geo.translate(0, 0, -inwardBiasM);
-
-  applyClosureBasisToGeometry(geo, tW, tH, n, rimCenter);
-  return geo;
+/** Panels sharing the rear center seam (closure spans both). */
+export function getRearClosureAdjacentPanelIndices(nSeams: PanelCount): {
+  leftPanel: number;
+  rightPanel: number;
+} {
+  const rearIdx = rearCenterSeamIndex(nSeams);
+  return {
+    leftPanel: (rearIdx - 1 + nSeams) % nSeams,
+    rightPanel: rearIdx % nSeams,
+  };
 }
 
 /** Debug: 3D outline of the stadium cutter profile in world space (for wireframe overlay). */
@@ -252,8 +282,7 @@ export function getClosureCutterOutline(
   sk: BuiltSkeleton,
 ): [number, number, number][] {
   const { tW, tH, rimAnchor } = getBackClosureOpeningFrame(sk);
-  const w = BACK_CLOSURE_WIDTH_M + BACK_CLOSURE_TAPE_MARGIN_M;
-  const s = BACK_CLOSURE_STRAIGHT_EDGE_M + BACK_CLOSURE_TAPE_MARGIN_M;
+  const { widthM: w, straightM: s } = getClosureCutterDimensions();
   const shape = buildStadiumShape(w, s);
   const pts2d = shape.getPoints(64);
   return pts2d.map((v) => {
@@ -265,96 +294,4 @@ export function getClosureCutterOutline(
       rimAnchor[2] + lx * tW[2] + ly * tH[2],
     ] as [number, number, number];
   });
-}
-
-/**
- * Hollow cut at the rear seam: crown is an open shell — use HOLLOW_SUBTRACTION (not SUBTRACTION)
- * to avoid spurious internal geometry. Cutter is a thin prism (flat bottom, straight sides, arc top).
- */
-export function subtractBackClosureFromCrown(
-  crownGeometry: THREE.BufferGeometry,
-  sk: BuiltSkeleton,
-): THREE.BufferGeometry {
-  const { tW, tH, n, rimAnchor } = getBackClosureOpeningFrame(sk);
-
-  const cutterGeo = buildClosureCutterGeometry(
-    BACK_CLOSURE_WIDTH_M + BACK_CLOSURE_TAPE_MARGIN_M,
-    BACK_CLOSURE_STRAIGHT_EDGE_M + BACK_CLOSURE_TAPE_MARGIN_M,
-    CLOSURE_CUT_DEPTH_M,
-    CLOSURE_CUT_INWARD_BIAS_M,
-    tW,
-    tH,
-    n,
-    rimAnchor,
-  );
-
-  const result = hollowSubtract(crownGeometry, cutterGeo);
-  cutterGeo.dispose();
-  return result;
-}
-
-/**
- * Apply back-closure CSG to per-panel geometries. Only the two panels adjacent to the
- * rear seam are cut; the rest are returned unchanged.
- */
-export function subtractBackClosureFromPanels(
-  panelGeos: THREE.BufferGeometry[],
-  sk: BuiltSkeleton,
-): THREE.BufferGeometry[] {
-  const { tW, tH, n, rimAnchor } = getBackClosureOpeningFrame(sk);
-
-  const cutterGeo = buildClosureCutterGeometry(
-    BACK_CLOSURE_WIDTH_M + BACK_CLOSURE_TAPE_MARGIN_M,
-    BACK_CLOSURE_STRAIGHT_EDGE_M + BACK_CLOSURE_TAPE_MARGIN_M,
-    CLOSURE_CUT_DEPTH_M,
-    CLOSURE_CUT_INWARD_BIAS_M,
-    tW,
-    tH,
-    n,
-    rimAnchor,
-  );
-
-  const nSeams = sk.spec.nSeams;
-  const rearIdx = rearCenterSeamIndex(nSeams);
-  const leftPanel = (rearIdx - 1 + nSeams) % nSeams;
-  const rightPanel = rearIdx % nSeams;
-
-  const result = panelGeos.map((geo, i) => {
-    if (i !== leftPanel && i !== rightPanel) return geo;
-    const cut = hollowSubtract(geo, cutterGeo);
-    geo.dispose();
-    return cut;
-  });
-
-  cutterGeo.dispose();
-  return result;
-}
-
-function hollowSubtract(
-  targetGeo: THREE.BufferGeometry,
-  cutterGeo: THREE.BufferGeometry,
-): THREE.BufferGeometry {
-  const targetClone = targetGeo.clone();
-  const merged = mergeVertices(targetClone, 1e-5);
-  targetClone.dispose();
-  merged.computeVertexNormals();
-
-  const matA = new THREE.MeshStandardMaterial();
-  const matB = new THREE.MeshStandardMaterial();
-  const targetBrush = new Brush(merged, matA);
-  const cutterBrush = new Brush(cutterGeo, matB);
-
-  targetBrush.updateMatrixWorld();
-  cutterBrush.updateMatrixWorld();
-
-  const evaluator = new Evaluator();
-  evaluator.attributes = ["position", "normal"];
-  const out = evaluator.evaluate(targetBrush, cutterBrush, HOLLOW_SUBTRACTION);
-
-  merged.dispose();
-  matA.dispose();
-  matB.dispose();
-
-  out.geometry.computeVertexNormals();
-  return out.geometry;
 }

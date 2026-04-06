@@ -1,10 +1,12 @@
 import * as THREE from "three";
 import {
   crossSeamTapeIndices,
+  evalSeamCurve,
   frontCenterSeamIndex,
   rearCenterSeamIndex,
-  sampleSeamWireframeTo,
+  sampleSeamWireframeRange,
   type BuiltSkeleton,
+  type SeamCurve,
 } from "@/lib/skeleton/geometry";
 import type { HatSkeletonSpec } from "@/lib/skeleton/types";
 import {
@@ -49,15 +51,87 @@ const SEAM_TAPE_ANCHOR_TOP_ALONG_SEAM_M = 0.0005;
 /** Rear seam tape only: run closer to the button (user asked not to shorten this further). */
 const SEAM_TAPE_U_MAX_REAR = 0.97;
 
-/** Front center seam tape: same u-range as rear. */
+/** Front center seam tape: same vertical span as the rear strip. */
 const SEAM_TAPE_U_MAX_FRONT = 0.97;
 
-/**
- * Cross / diameter tapes: end a bit lower toward the rim than the rear strip (stays off the button area).
- */
-const SEAM_TAPE_U_MAX_CROSS = 0.91;
+/** Cross / diameter tapes: same vertical span as the rear strip. */
+const SEAM_TAPE_U_MAX_CROSS = 0.97;
 
 const SEAM_CURVE_SEGMENTS = 40;
+
+/**
+ * Distance along the seam curve from the rim (t = 0) where tape starts, so strips are not
+ * flush with the bottom of the hat. Default 1.5 cm.
+ */
+export const SEAM_TAPE_RIM_OFFSET_M = 0.015;
+
+/** Extra arc length from rim (m) for front center tape only, on top of {@link SEAM_TAPE_RIM_OFFSET_M}. */
+const SEAM_TAPE_FRONT_EXTRA_RIM_OFFSET_M = 0.01;
+
+const RIM_OFFSET_ARC_SAMPLES = 256;
+
+/**
+ * Normalized seam parameter `t` such that arc length from rim (t = 0) to `t` is at least
+ * `distanceM` (same sampling convention as {@link sampleSeamWireframeRange}).
+ */
+function seamTapeTMinAfterRimDistanceM(
+  curve: SeamCurve,
+  distanceM: number,
+): number {
+  if (distanceM <= 1e-12) return 0;
+  const pts: [number, number, number][] = [];
+  for (let i = 0; i <= RIM_OFFSET_ARC_SAMPLES; i++) {
+    const t = i / RIM_OFFSET_ARC_SAMPLES;
+    const p =
+      curve.kind === "vSplit"
+        ? evalSeamCurve({ ...curve, blend: 1 }, t)
+        : evalSeamCurve(curve, t);
+    pts.push(p);
+  }
+  let acc = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const d = Math.hypot(
+      pts[i]![0] - pts[i - 1]![0],
+      pts[i]![1] - pts[i - 1]![1],
+      pts[i]![2] - pts[i - 1]![2],
+    );
+    if (acc + d >= distanceM) {
+      const need = distanceM - acc;
+      const frac = d > 1e-15 ? need / d : 0;
+      const t0 = (i - 1) / RIM_OFFSET_ARC_SAMPLES;
+      const t1 = i / RIM_OFFSET_ARC_SAMPLES;
+      return Math.min(1, t0 + frac * (t1 - t0));
+    }
+    acc += d;
+  }
+  return 0.98;
+}
+
+/**
+ * Minimum normalized seam `t` (rim = 0) so tape clears the tuck gap under a curved visor.
+ * Scales with `visorCurvatureM` (~3 cm → ~0.29); 0 when flat.
+ */
+function seamTapeExtraMinUFrontForCurvedVisor(sk: BuiltSkeleton): number {
+  const c = sk.spec.visor.visorCurvatureM ?? 0;
+  if (c < 1e-9) return 0;
+  return Math.min(0.42, 0.08 + c * 7);
+}
+
+/**
+ * Rim start `t` for a seam: default arc offset for all seams; front center seam also gets
+ * extra arc length and visor clearance (covers 5-panel where front tape is only on cross paths).
+ */
+function seamTapeRimMinUForSeam(sk: BuiltSkeleton, seamIdx: number): number {
+  const curve = sk.seamControls[seamIdx]!;
+  const frontIdx = frontCenterSeamIndex(sk.spec.nSeams);
+  const isFrontCenter = seamIdx === frontIdx;
+  const distanceM =
+    SEAM_TAPE_RIM_OFFSET_M +
+    (isFrontCenter ? SEAM_TAPE_FRONT_EXTRA_RIM_OFFSET_M : 0);
+  const baseT = seamTapeTMinAfterRimDistanceM(curve, distanceM);
+  if (!isFrontCenter) return baseT;
+  return Math.max(baseT, seamTapeExtraMinUFrontForCurvedVisor(sk));
+}
 
 function crownNormalFn(spec: HatSkeletonSpec) {
   return (p: Vec3) => outwardCrownNormalApprox(p, spec);
@@ -221,11 +295,15 @@ function seamWireframePointsRaw(
   sk: BuiltSkeleton,
   seamIdx: number,
   segments: number,
+  uMin: number,
   uMax: number,
 ): [number, number, number][] {
-  return sampleSeamWireframeTo(sk.seamControls[seamIdx]!, segments, uMax).map(
-    (p) => offsetSeamTapeAlongSurface(p, sk.spec),
-  );
+  return sampleSeamWireframeRange(
+    sk.seamControls[seamIdx]!,
+    segments,
+    uMin,
+    uMax,
+  ).map((p) => offsetSeamTapeAlongSurface(p, sk.spec));
 }
 
 function seamWireframeOffset(
@@ -233,10 +311,12 @@ function seamWireframeOffset(
   seamIdx: number,
   segments: number,
 ): [number, number, number][] {
+  const uMin = seamTapeRimMinUForSeam(sk, seamIdx);
   const pts = seamWireframePointsRaw(
     sk,
     seamIdx,
     segments,
+    uMin,
     SEAM_TAPE_U_MAX_CROSS,
   );
   applySeamTapeAnchorsOpenStrip(pts);
@@ -259,8 +339,22 @@ function joinOppositeSeamDiameter(
   b: number,
   segments: number,
 ): [number, number, number][] {
-  const stripA = seamWireframePointsRaw(sk, a, segments, SEAM_TAPE_U_MAX_CROSS);
-  const stripB = seamWireframePointsRaw(sk, b, segments, SEAM_TAPE_U_MAX_CROSS);
+  const uMinA = seamTapeRimMinUForSeam(sk, a);
+  const uMinB = seamTapeRimMinUForSeam(sk, b);
+  const stripA = seamWireframePointsRaw(
+    sk,
+    a,
+    segments,
+    uMinA,
+    SEAM_TAPE_U_MAX_CROSS,
+  );
+  const stripB = seamWireframePointsRaw(
+    sk,
+    b,
+    segments,
+    uMinB,
+    SEAM_TAPE_U_MAX_CROSS,
+  );
   if (stripA.length < 2 || stripB.length < 2) return stripA;
   const apexA = stripA[stripA.length - 1]!;
   const apexB = stripB[stripB.length - 1]!;
@@ -316,9 +410,11 @@ export function buildSeamTapeGroup(sk: BuiltSkeleton): THREE.Group {
   });
 
   const rearIdx = rearCenterSeamIndex(sk.spec.nSeams);
-  const rearRaw = sampleSeamWireframeTo(
+  const rearUMin = seamTapeRimMinUForSeam(sk, rearIdx);
+  const rearRaw = sampleSeamWireframeRange(
     sk.seamControls[rearIdx]!,
     SEAM_CURVE_SEGMENTS,
+    rearUMin,
     SEAM_TAPE_U_MAX_REAR,
   ).map((p) => offsetSeamTapeAlongSurface(p, sk.spec));
   applySeamTapeAnchorsOpenStrip(rearRaw);
@@ -357,9 +453,12 @@ export function buildSeamTapeGroup(sk: BuiltSkeleton): THREE.Group {
   // Front center seam tape — only in 6-panel mode (full front seam)
   if (sk.spec.fivePanelCenterSeamLength >= 1) {
     const frontIdx = frontCenterSeamIndex(sk.spec.nSeams);
-    const frontRaw = sampleSeamWireframeTo(
-      sk.seamControls[frontIdx]!,
+    const frontCurve = sk.seamControls[frontIdx]!;
+    const uMinFront = seamTapeRimMinUForSeam(sk, frontIdx);
+    const frontRaw = sampleSeamWireframeRange(
+      frontCurve,
       SEAM_CURVE_SEGMENTS,
+      uMinFront,
       SEAM_TAPE_U_MAX_FRONT,
     ).map((p) => offsetSeamTapeAlongSurface(p, sk.spec));
     applySeamTapeAnchorsOpenStrip(frontRaw);

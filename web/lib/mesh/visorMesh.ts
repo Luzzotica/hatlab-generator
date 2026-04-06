@@ -39,14 +39,244 @@ export function computeVisorOuterCurvatureZArray(
 export function visorOuterCurvatureZLocal(sk: BuiltSkeleton): number[] {
   const m = sk.visorPolyline.length;
   if (m < 2) return [];
-  return computeVisorOuterCurvatureZArray(m, sk.spec.visor.visorCurvatureM ?? 0);
+  return computeVisorOuterCurvatureZArray(
+    m,
+    sk.spec.visor.visorCurvatureM ?? 0,
+  );
+}
+
+/**
+ * Fraction of outer-edge droop on the inner rim (hat attachment). Use `1` so the base follows
+ * the same height profile as the bill; values below 1 leave the rim lower than the outer edge.
+ */
+export const VISOR_RIM_DROOP_BLEND = 1;
+
+function computeVisorRimDroopZArray(droop: number[]): number[] {
+  return droop.map((z) => z * VISOR_RIM_DROOP_BLEND);
+}
+
+/** Rim arc, outer planform, and per-column Z — same basis as visor slab quads (before fillet insets). */
+export function getVisorRuledBasis(sk: BuiltSkeleton): {
+  m: number;
+  /** Chord midpoint between sweatband tips (same frame as {@link sampleVisorSuperellipsePolyline}). */
+  rimMid: [number, number, number];
+  rim: [number, number, number][];
+  outer: [number, number, number][];
+  droop: number[];
+  rimDroop: number[];
+} | null {
+  const outer = sk.visorPolyline;
+  const m = outer.length;
+  if (m < 2) return null;
+  const spec = sk.spec;
+  const v = spec.visor;
+  const halfSpan = effectiveVisorHalfSpanRad(v, spec.nSeams, sk.angles);
+  const c = v.attachAngleRad;
+  const rim: [number, number, number][] = [];
+  for (let i = 0; i < m; i++) {
+    const u = i / (m - 1);
+    const theta = c - halfSpan + u * 2 * halfSpan;
+    rim.push(
+      sweatbandPoint(theta, spec.semiAxisX, spec.semiAxisY, spec.yawRad),
+    );
+  }
+  const droop = computeVisorOuterCurvatureZArray(m, v.visorCurvatureM ?? 0);
+  const rimDroop = computeVisorRimDroopZArray(droop);
+  const r0 = rim[0]!;
+  const r1 = rim[m - 1]!;
+  const rimMid: [number, number, number] = [
+    0.5 * (r0[0] + r1[0]),
+    0.5 * (r0[1] + r1[1]),
+    0.5 * (r0[2] + r1[2]),
+  ];
+  return {
+    m,
+    rimMid,
+    rim,
+    outer: outer as [number, number, number][],
+    droop,
+    rimDroop,
+  };
+}
+
+function lerp3(
+  a: [number, number, number],
+  b: [number, number, number],
+  t: number,
+): [number, number, number] {
+  const u = 1 - t;
+  return [u * a[0] + t * b[0], u * a[1] + t * b[1], u * a[2] + t * b[2]];
+}
+
+/**
+ * Ruled bill surface from inner rim toward outer edge (slab local Z before {@link applyVisorSlabTransform}).
+ * `s` = span 0…1 (left tip → right); `d` = depth 0 = inner rim, 1 = outer edge.
+ *
+ * XY uses homothety from the chord midpoint (`rimMid`) toward the outer superellipse so fixed-`d`
+ * curves are concentric copies of the bill (same family as {@link sampleVisorSuperellipsePolyline} with
+ * `aScale = bScale`). A perpendicular blend restores the exact sweatband rim at `d = 0`.
+ * Z still interpolates rim / outer droop. For fixed `s`, the map `d ↦ P` is affine (straight ruling).
+ */
+export function evalVisorRuledPointLocal(
+  sk: BuiltSkeleton,
+  s: number,
+  d: number,
+): [number, number, number] {
+  const basis = getVisorRuledBasis(sk);
+  if (!basis) return [0, 0, 0];
+  const { m, rimMid, rim, outer, droop, rimDroop } = basis;
+  const sCl = Math.max(0, Math.min(1, s));
+  const dCl = Math.max(0, Math.min(1, d));
+  const fx = sCl * (m - 1);
+  const i0 = Math.min(Math.floor(fx), m - 2);
+  const frac = fx - i0;
+  const rimS = lerp3(rim[i0]!, rim[i0 + 1]!, frac);
+  const outS = lerp3(outer[i0]!, outer[i0 + 1]!, frac);
+  const zRim = rimDroop[i0]! * (1 - frac) + rimDroop[i0 + 1]! * frac;
+  const zOuter = droop[i0]! * (1 - frac) + droop[i0 + 1]! * frac;
+  const z = (1 - dCl) * zRim + dCl * zOuter;
+
+  const vx = outS[0] - rimMid[0];
+  const vy = outS[1] - rimMid[1];
+  const lenO2 = vx * vx + vy * vy;
+  if (lenO2 < 1e-18) {
+    const xy = lerp3(rimS, outS, dCl);
+    return [xy[0], xy[1], z];
+  }
+
+  const rx = rimS[0] - rimMid[0];
+  const ry = rimS[1] - rimMid[1];
+  const kRim = (rx * vx + ry * vy) / lenO2;
+  const px = rimMid[0] + kRim * vx;
+  const py = rimMid[1] + kRim * vy;
+  const cx = rimS[0] - px;
+  const cy = rimS[1] - py;
+  const t = (1 - dCl) * kRim + dCl;
+  const x = rimMid[0] + t * vx + (1 - dCl) * cx;
+  const y = rimMid[1] + t * vy + (1 - dCl) * cy;
+  return [x, y, z];
+}
+
+/** Top outer face: same XY as bottom at (s,d), local Z + {@link VISOR_THICKNESS_M}. */
+export function evalVisorRuledTopLocal(
+  sk: BuiltSkeleton,
+  s: number,
+  d: number,
+): [number, number, number] {
+  const p = evalVisorRuledPointLocal(sk, s, d);
+  return [p[0], p[1], p[2] + VISOR_THICKNESS_M];
+}
+
+export function evalVisorRuledPointWorld(
+  sk: BuiltSkeleton,
+  s: number,
+  d: number,
+): [number, number, number] {
+  return applyVisorSlabTransform(evalVisorRuledPointLocal(sk, s, d), sk);
+}
+
+export function evalVisorRuledTopWorld(
+  sk: BuiltSkeleton,
+  s: number,
+  d: number,
+): [number, number, number] {
+  return applyVisorSlabTransform(evalVisorRuledTopLocal(sk, s, d), sk);
+}
+
+const VISOR_RULED_FD_H = 1e-4;
+
+function visorCross3(
+  a: [number, number, number],
+  b: [number, number, number],
+): [number, number, number] {
+  return [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+}
+
+/**
+ * Unit normal on the ruled bill (world space) from ∂P/∂s × ∂P/∂d on the **bottom** face only.
+ * Top and bottom faces share the same tangents in (s,d), so the cross product is identical for
+ * both — we must **not** offset both ribbons in that same direction. Orient using the slab
+ * thickness vector T = top − bottom so **top** gets **+n** (outward toward open air above) and
+ * **bottom** gets **−n** (outward below).
+ */
+export function evalVisorRuledNormalWorld(
+  sk: BuiltSkeleton,
+  s: number,
+  d: number,
+  top: boolean,
+): [number, number, number] {
+  const sm = Math.max(0, Math.min(1, s));
+  const dm = Math.max(0, Math.min(1, d));
+  const h = VISOR_RULED_FD_H;
+
+  const sa = Math.max(0, sm - h);
+  const sb = Math.min(1, sm + h);
+  const da = Math.max(0, dm - h);
+  const db = Math.min(1, dm + h);
+
+  const pa = evalVisorRuledPointWorld(sk, sa, dm);
+  const pb = evalVisorRuledPointWorld(sk, sb, dm);
+  const ds = sb - sa;
+  const dPs: [number, number, number] =
+    ds > 1e-12
+      ? [(pb[0] - pa[0]) / ds, (pb[1] - pa[1]) / ds, (pb[2] - pa[2]) / ds]
+      : [0, 0, 0];
+
+  const pc = evalVisorRuledPointWorld(sk, sm, da);
+  const pd = evalVisorRuledPointWorld(sk, sm, db);
+  const dd = db - da;
+  const dPd: [number, number, number] =
+    dd > 1e-12
+      ? [(pd[0] - pc[0]) / dd, (pd[1] - pc[1]) / dd, (pd[2] - pc[2]) / dd]
+      : [0, 0, 0];
+
+  let n = visorCross3(dPs, dPd);
+  let len = Math.hypot(n[0], n[1], n[2]);
+  if (len < 1e-12) {
+    n = visorCross3(dPd, dPs);
+    len = Math.hypot(n[0], n[1], n[2]);
+  }
+
+  const pBot = evalVisorRuledPointWorld(sk, sm, dm);
+  const pTop = evalVisorRuledTopWorld(sk, sm, dm);
+  const Tx = pTop[0] - pBot[0];
+  const Ty = pTop[1] - pBot[1];
+  const Tz = pTop[2] - pBot[2];
+  const tLen = Math.hypot(Tx, Ty, Tz);
+
+  if (len < 1e-12) {
+    if (tLen < 1e-12) return [0, 0, 1];
+    const inv = 1 / tLen;
+    const nT: [number, number, number] = [Tx * inv, Ty * inv, Tz * inv];
+    return top ? nT : [-nT[0], -nT[1], -nT[2]];
+  }
+  n = [n[0] / len, n[1] / len, n[2] / len];
+
+  if (tLen > 1e-12) {
+    const dotT = n[0] * Tx + n[1] * Ty + n[2] * Tz;
+    if (dotT < 0) {
+      n = [-n[0], -n[1], -n[2]];
+    }
+  }
+
+  return top ? n : [-n[0], -n[1], -n[2]];
 }
 
 /**
  * Z offset applied to the entire visor slab so it sits *under* the crown rim.
  * Top surface lands at z ≈ 0 (flush with the rim); bottom at z ≈ −thickness.
+ * {@link applyVisorSlabTransform} also adds {@link visorCurvatureSlabLiftM} when the bill curves.
  */
 export const VISOR_Z_BASE = -VISOR_THICKNESS_M;
+
+/** Upward shift (m) for the whole visor slab: `visorCurvatureM / 10` to close gaps to the crown. */
+export function visorCurvatureSlabLiftM(sk: BuiltSkeleton): number {
+  return (sk.spec.visor.visorCurvatureM ?? 0) / 25;
+}
 
 /**
  * Radial pull toward the hat center (XY) so the visor sits inside the crown /
@@ -70,12 +300,14 @@ export function applyVisorSlabXYOnly(
 
 /**
  * Same XY radial inset + Z shift applied to all visor slab vertices (bottom, top, wrap).
+ * Adds {@link visorCurvatureSlabLiftM} so the bill moves up slightly when curved.
  */
 export function applyVisorSlabTransform(
   p: [number, number, number],
+  sk: BuiltSkeleton,
 ): [number, number, number] {
   const [x, y] = applyVisorSlabXYOnly(p);
-  return [x, y, p[2] + VISOR_Z_BASE];
+  return [x, y, p[2] + VISOR_Z_BASE + visorCurvatureSlabLiftM(sk)];
 }
 
 /** How far the tuck strip rises along the crown meridian under the hat. */
@@ -167,6 +399,8 @@ interface VisorSlabData {
   R: number;
   /** Per-sample z-displacement on the outer edge (+Z = up). Zero at tips, max at center. */
   droop: number[];
+  /** Inner-rim Z in slab space (`droop` × {@link VISOR_RIM_DROOP_BLEND}; equals `droop` when blend is 1). */
+  rimDroop: number[];
   rim: [number, number, number][];
   outer: [number, number, number][];
   rimBotFlat: [number, number, number][];
@@ -214,17 +448,20 @@ function computeVisorSlabData(sk: BuiltSkeleton): VisorSlabData | null {
   const Nout = outer.map((p) => inwardXY(p, cx, cy));
 
   const droop = computeVisorOuterCurvatureZArray(m, v.visorCurvatureM ?? 0);
+  const rimDroop = computeVisorRimDroopZArray(droop);
 
   return {
     m,
     t,
     R,
     droop,
+    rimDroop,
     rim,
     outer: outer as [number, number, number][],
     rimBotFlat: rim.map((p, i) => {
       const N = Nrim[i]!;
-      return [p[0] + N[0] * R, p[1] + N[1] * R, 0] as [number, number, number];
+      const rz = rimDroop[i]!;
+      return [p[0] + N[0] * R, p[1] + N[1] * R, rz] as [number, number, number];
     }),
     outerBotFlat: outer.map((p, i) => {
       const N = Nout[i]!;
@@ -236,7 +473,12 @@ function computeVisorSlabData(sk: BuiltSkeleton): VisorSlabData | null {
     }),
     rimTopFlat: rim.map((p, i) => {
       const N = Nrim[i]!;
-      return [p[0] + N[0] * R, p[1] + N[1] * R, t] as [number, number, number];
+      const rz = rimDroop[i]!;
+      return [p[0] + N[0] * R, p[1] + N[1] * R, rz + t] as [
+        number,
+        number,
+        number,
+      ];
     }),
     outerTopFlat: outer.map((p, i) => {
       const N = Nout[i]!;
@@ -247,10 +489,10 @@ function computeVisorSlabData(sk: BuiltSkeleton): VisorSlabData | null {
       ];
     }),
     rimFilletBot: rim.map((p, i) =>
-      filletArcBot(p, Nrim[i]!, R, FILLET_SEGMENTS),
+      filletArcBot(p, Nrim[i]!, R, FILLET_SEGMENTS, rimDroop[i]!),
     ),
     rimFilletTop: rim.map((p, i) =>
-      filletArcTop(p, Nrim[i]!, R, t, FILLET_SEGMENTS),
+      filletArcTop(p, Nrim[i]!, R, t, FILLET_SEGMENTS, rimDroop[i]!),
     ),
     outerFilletBot: outer.map((p, i) =>
       filletArcBot(p, Nout[i]!, R, FILLET_SEGMENTS, droop[i]!),
@@ -329,6 +571,7 @@ export function buildVisorTopBottomGeometries(
     t,
     R,
     droop,
+    rimDroop,
     rim,
     outer,
     rimBotFlat,
@@ -370,8 +613,9 @@ export function buildVisorTopBottomGeometries(
   }
 
   const omitInnerRim = options?.omitInnerRimInTop === true;
+
   if (!omitInnerRim) {
-    // --- Inner rim edge (no droop — stays flush with sweatband) ---
+    // --- Inner rim edge (rim droop matches bill curvature; wall connects fillets) ---
     for (let i = 0; i < m - 1; i++) {
       for (let k = 0; k < FILLET_SEGMENTS; k++) {
         pushQuad(
@@ -384,17 +628,27 @@ export function buildVisorTopBottomGeometries(
       }
     }
     for (let i = 0; i < m - 1; i++) {
-      const r0b: [number, number, number] = [rim[i]![0], rim[i]![1], zBotWall];
+      const d0 = rimDroop[i]!;
+      const d1 = rimDroop[i + 1]!;
+      const r0b: [number, number, number] = [
+        rim[i]![0],
+        rim[i]![1],
+        d0 + zBotWall,
+      ];
       const r1b: [number, number, number] = [
         rim[i + 1]![0],
         rim[i + 1]![1],
-        zBotWall,
+        d1 + zBotWall,
       ];
-      const r0t: [number, number, number] = [rim[i]![0], rim[i]![1], zTopWall];
+      const r0t: [number, number, number] = [
+        rim[i]![0],
+        rim[i]![1],
+        d0 + zTopWall,
+      ];
       const r1t: [number, number, number] = [
         rim[i + 1]![0],
         rim[i + 1]![1],
-        zTopWall,
+        d1 + zTopWall,
       ];
       pushQuad(topPos, r0b, r1b, r1t, r0t);
     }
@@ -463,6 +717,7 @@ export function buildVisorTopBottomGeometries(
   // --- End caps (left & right tips of visor; droop[0]=droop[m-1]=0) ---
   for (const side of [0, m - 1] as const) {
     const ds = droop[side]!;
+    const dr = rimDroop[side]!;
     for (let k = 0; k < FILLET_SEGMENTS; k++) {
       pushQuad(
         topPos,
@@ -475,7 +730,7 @@ export function buildVisorTopBottomGeometries(
     const rb: [number, number, number] = [
       rim[side]![0],
       rim[side]![1],
-      zBotWall,
+      dr + zBotWall,
     ];
     const ob: [number, number, number] = [
       outer[side]![0],
@@ -485,7 +740,7 @@ export function buildVisorTopBottomGeometries(
     const rt: [number, number, number] = [
       rim[side]![0],
       rim[side]![1],
-      zTopWall,
+      dr + zTopWall,
     ];
     const ot: [number, number, number] = [
       outer[side]![0],
@@ -506,11 +761,10 @@ export function buildVisorTopBottomGeometries(
 
   for (const arr of [topPos, botPos]) {
     for (let i = 0; i < arr.length; i += 3) {
-      const [nx, ny, nz] = applyVisorSlabTransform([
-        arr[i]!,
-        arr[i + 1]!,
-        arr[i + 2]!,
-      ]);
+      const [nx, ny, nz] = applyVisorSlabTransform(
+        [arr[i]!, arr[i + 1]!, arr[i + 2]!],
+        sk,
+      );
       arr[i] = nx;
       arr[i + 1] = ny;
       arr[i + 2] = nz;
@@ -579,7 +833,7 @@ export function buildVisorFilletGeometry(
     const u = i / (m - 1);
     const theta = center - halfSpan + u * 2 * halfSpan;
 
-    const A = applyVisorSlabTransform(rimBotFlat[i]!);
+    const A = applyVisorSlabTransform(rimBotFlat[i]!, sk);
     const kTarget = findKRingForDeltaZ(
       sk,
       theta,
@@ -748,7 +1002,8 @@ export function buildVisorFilletGeometry(
  * Small inward inset so the tuck sits just inside the crown shell,
  * visible when looking up through the gap below the shifted-down visor.
  */
-const TUCK_INSET_M = CROWN_SHELL_THICKNESS_M * 0.3;
+/** Inward radial XY inset for tuck strip (bill rope end ladders match this). */
+export const TUCK_INSET_M = CROWN_SHELL_THICKNESS_M * 0.3;
 const TUCK_RINGS = 10;
 
 /** Move a point toward the z-axis in XY by `dist`. */

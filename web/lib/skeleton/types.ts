@@ -27,10 +27,30 @@ export interface VisorSpec {
    * Maximum at span center and zero at the tips (sine bell), increasing toward the outer edge.
    */
   visorCurvatureM: number;
+  /**
+   * Scales how much the front-rise crown panels lift (+Z) to follow the visor curve.
+   * 0 = no crown bend; 1 matches the visor curvature amplitude at the rim.
+   */
+  visorFrontLiftRatio: number;
+  /**
+   * Multiplier on visor **thread** planform depth (forward `b` toward the brim). Valid range `[0.1, 4]`.
+   * Tune when automatic placement vs visor length needs a manual nudge.
+   */
+  visorThreadingScale?: number;
 }
 
 /** Only five- and six-panel crowns are supported; seam angles follow cap conventions (see `panelSeamAngles`). */
 export type PanelCount = 5 | 6;
+
+/**
+ * Which crown layout the viewer uses (`nSeams` stays 6 for mesh topology; 5-panel is the center-seam look).
+ * Set explicitly when toggling panel buttons; used for eyelets and UI. Geometry still keys off
+ * `fivePanelCenterSeamLength` for the partial front seam.
+ */
+export type CrownPanelMode = 5 | 6;
+
+/** Crown ventilation eyelets: same mesh for `cloth` and `metal`; materials differ. */
+export type EyeletStyle = "none" | "cloth" | "metal";
 
 /**
  * How seam curves (rim → top) are defined: quadratic bulge (`squareness`), arc-length target
@@ -158,6 +178,8 @@ export interface HatSkeletonSpec {
    * fraction of the straight segment apex → front rim (0 = off). Real caps often stop ~⅓ down.
    */
   fivePanelCenterSeamLength: number;
+  /** Viewer/source-of-truth for 5 vs 6 crown style (see {@link CrownPanelMode}). */
+  crownPanelMode: CrownPanelMode;
   /**
    * V-split data for the front seam (6-panel: seam 1). When set, `buildSkeleton` uses a
    * piecewise-linear V path blended with the base curve. Set by the measurement solver
@@ -183,6 +205,13 @@ export interface HatSkeletonSpec {
    * Typical ~0.0005 (0.5 mm).
    */
   seamGrooveDepthM: number;
+  /** Vent eyelets on crown panels (see `eyeletPanelIndices` in geometry). */
+  eyeletStyle: EyeletStyle;
+  /**
+   * Arc length (m) down the panel mid-meridian from crown top toward rim before projecting to mesh.
+   * Typical ~0.04–0.05.
+   */
+  eyeletDropFromTopM: number;
   visor: VisorSpec;
 }
 
@@ -197,6 +226,9 @@ export const defaultVisorSpec = (): VisorSpec => ({
   superellipseN: 3,
   samples: 48,
   visorCurvatureM: 0,
+  visorFrontLiftRatio: 1,
+  /** Default &lt; 1 so threads fit typical brim depth; raise in the viewer if needed. */
+  visorThreadingScale: 0.9,
 });
 
 export const defaultHatSkeletonSpec = (): HatSkeletonSpec => ({
@@ -217,8 +249,11 @@ export const defaultHatSkeletonSpec = (): HatSkeletonSpec => ({
   sixPanelSeams: null,
   fivePanelFrontSeams: { visor: 0.35, crown: 0.35, splitT: 0.45 },
   fivePanelCenterSeamLength: 1.0,
+  crownPanelMode: 6,
   backClosureOpening: false,
   seamGrooveDepthM: 0.0005,
+  eyeletStyle: "none",
+  eyeletDropFromTopM: 0.045,
   visor: defaultVisorSpec(),
 });
 
@@ -232,9 +267,17 @@ export function mergeHatSpecDefaults(spec: HatSkeletonSpec): HatSkeletonSpec {
   if (spec.frontVSplit != null) {
     topRimFraction = Math.max(topRimFraction, MIN_TOP_RIM_FRACTION_WITH_FRONT_VSPLIT);
   }
+  const crownPanelMode: CrownPanelMode =
+    spec.crownPanelMode ??
+    (spec.nSeams === 5
+      ? 5
+      : spec.fivePanelCenterSeamLength < 1
+        ? 5
+        : 6);
   return {
     ...d,
     ...spec,
+    crownPanelMode,
     seamCurveMode: spec.seamCurveMode ?? d.seamCurveMode,
     seamArcLengthMultiplier: spec.seamArcLengthMultiplier ?? d.seamArcLengthMultiplier,
     seamSuperellipseN: spec.seamSuperellipseN ?? d.seamSuperellipseN,
@@ -243,6 +286,8 @@ export function mergeHatSpecDefaults(spec: HatSkeletonSpec): HatSkeletonSpec {
     seamEndpointStyles: spec.seamEndpointStyles ?? d.seamEndpointStyles,
     seamTargetArcLengthM: spec.seamTargetArcLengthM ?? d.seamTargetArcLengthM,
     seamGrooveDepthM: spec.seamGrooveDepthM ?? d.seamGrooveDepthM,
+    eyeletStyle: spec.eyeletStyle ?? d.eyeletStyle,
+    eyeletDropFromTopM: spec.eyeletDropFromTopM ?? d.eyeletDropFromTopM,
     visor: { ...d.visor, ...spec.visor },
   };
 }
@@ -275,6 +320,14 @@ export function validateSpec(spec: HatSkeletonSpec): void {
   const curv = spec.visor.visorCurvatureM ?? 0;
   if (curv < 0 || curv > 0.04) {
     throw new Error("visorCurvatureM must be in [0, 0.04]");
+  }
+  const liftR = spec.visor.visorFrontLiftRatio ?? 1;
+  if (liftR < 0 || liftR > 1.5) {
+    throw new Error("visorFrontLiftRatio must be in [0, 1.5]");
+  }
+  const threadScale = spec.visor.visorThreadingScale ?? 1;
+  if (threadScale < 0.1 || threadScale > 4) {
+    throw new Error("visorThreadingScale must be in [0.1, 4]");
   }
   if (
     spec.fivePanelCenterSeamLength < 0 ||
@@ -318,5 +371,17 @@ export function validateSpec(spec: HatSkeletonSpec): void {
   const seamN = spec.seamSuperellipseN ?? defaultHatSkeletonSpec().seamSuperellipseN;
   if (seamN < 2 || seamN > 10) {
     throw new Error("seamSuperellipseN must be in [2, 10]");
+  }
+  const es = spec.eyeletStyle ?? defaultHatSkeletonSpec().eyeletStyle;
+  if (es !== "none" && es !== "cloth" && es !== "metal") {
+    throw new Error("eyeletStyle must be none, cloth, or metal");
+  }
+  const drop = spec.eyeletDropFromTopM ?? defaultHatSkeletonSpec().eyeletDropFromTopM;
+  if (drop < 0.005 || drop > 0.15) {
+    throw new Error("eyeletDropFromTopM must be in [0.005, 0.15]");
+  }
+  const cpm = spec.crownPanelMode ?? defaultHatSkeletonSpec().crownPanelMode;
+  if (cpm !== 5 && cpm !== 6) {
+    throw new Error("crownPanelMode must be 5 or 6");
   }
 }

@@ -13,12 +13,12 @@ import * as THREE from "three";
 import { Canvas } from "@react-three/fiber";
 import { OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import { HatModel } from "./HatModel";
-import { DebugThreadingVisibilityLog } from "./DebugThreadingVisibilityLog";
 import {
   defaultHatSkeletonSpec,
   mergeHatSpecDefaults,
   type FrontSeamMode,
   type HatMeasurementTargets,
+  type EyeletStyle,
   type HatSkeletonSpec,
   type SeamEndpointStyle,
   validateSpec,
@@ -40,7 +40,7 @@ type SeamGroupKey = "front" | "sideFront" | "sideBack" | "rear";
 function patchGroupEndpointStyle(
   spec: HatSkeletonSpec,
   groupKey: SeamGroupKey,
-  patch: Partial<SeamEndpointStyle>
+  patch: Partial<SeamEndpointStyle>,
 ): HatSkeletonSpec {
   const indices = seamGroupIndices(spec.nSeams)[groupKey];
   if (indices.length === 0) return spec;
@@ -98,7 +98,7 @@ function Panel({
   }, [onMeasurementHighlightChange]);
 
   const hiInput = (
-    field: Exclude<MeasurementFieldHighlight, null>
+    field: Exclude<MeasurementFieldHighlight, null>,
   ): CSSProperties =>
     measurementHighlight === field
       ? {
@@ -125,34 +125,32 @@ function Panel({
         <span style={{ fontWeight: 600 }}>Panels</span>
         <div style={{ display: "flex", gap: 8 }}>
           {([5, 6] as const).map((n) => {
-            const is5 = spec.fivePanelCenterSeamLength < 1;
+            const is5 = spec.crownPanelMode === 5;
             const active = n === 5 ? is5 : !is5;
             return (
-            <button
-              key={n}
-              type="button"
-              onClick={() =>
-                set({
-                  nSeams: 6 as const,
-                  fivePanelCenterSeamLength: n === 5 ? 0.36 : 1.0,
-                })
-              }
-              style={{
-                flex: 1,
-                padding: "8px 10px",
-                borderRadius: 6,
-                border:
-                  active
-                    ? "1px solid #3b82f6"
-                    : "1px solid #374151",
-                background: active ? "#1e3a5f" : "#1f2937",
-                color: "#e5e7eb",
-                cursor: "pointer",
-                fontSize: 12,
-              }}
-            >
-              {n}-panel
-            </button>
+              <button
+                key={n}
+                type="button"
+                onClick={() =>
+                  set({
+                    nSeams: 6 as const,
+                    crownPanelMode: n,
+                    fivePanelCenterSeamLength: n === 5 ? 0.36 : 1.0,
+                  })
+                }
+                style={{
+                  flex: 1,
+                  padding: "8px 10px",
+                  borderRadius: 6,
+                  border: active ? "1px solid #3b82f6" : "1px solid #374151",
+                  background: active ? "#1e3a5f" : "#1f2937",
+                  color: "#e5e7eb",
+                  cursor: "pointer",
+                  fontSize: 12,
+                }}
+              >
+                {n}-panel
+              </button>
             );
           })}
         </div>
@@ -166,8 +164,16 @@ function Panel({
         }}
       >
         <span style={{ fontWeight: 600 }}>Measurements (metres)</span>
-        <p style={{ margin: "4px 0 8px", opacity: 0.65, fontSize: 11, lineHeight: 1.35 }}>
-          Focus a field to highlight (green = base, amber = visor, magenta = seams).
+        <p
+          style={{
+            margin: "4px 0 8px",
+            opacity: 0.65,
+            fontSize: 11,
+            lineHeight: 1.35,
+          }}
+        >
+          Focus a field to highlight (green = base, amber = visor, magenta =
+          seams).
         </p>
         <label style={lab}>
           Base circumference
@@ -202,9 +208,7 @@ function Panel({
               value={mt.visorLengthM}
               style={hiInput("visorLength")}
               onFocus={() => onMeasurementHighlightChange("visorLength")}
-              onChange={(e) =>
-                setMt({ visorLengthM: Number(e.target.value) })
-              }
+              onChange={(e) => setMt({ visorLengthM: Number(e.target.value) })}
             />
           </label>
           <label style={lab}>
@@ -218,7 +222,10 @@ function Panel({
                     min={range.min}
                     max={range.max}
                     step={0.001}
-                    value={Math.min(Math.max(mt.visorWidthM, range.min), range.max)}
+                    value={Math.min(
+                      Math.max(mt.visorWidthM, range.min),
+                      range.max,
+                    )}
                     style={hiInput("visorWidth")}
                     onFocus={() => onMeasurementHighlightChange("visorWidth")}
                     onChange={(e) =>
@@ -258,6 +265,20 @@ function Panel({
             </select>
           </label>
           <label style={lab}>
+            Front crown lift (with curve)
+            <input
+              type="range"
+              min={0}
+              max={1.5}
+              step={0.05}
+              value={v.visorFrontLiftRatio ?? 1}
+              onChange={(e) =>
+                setVisor({ visorFrontLiftRatio: Number(e.target.value) })
+              }
+            />
+            <span>{(v.visorFrontLiftRatio ?? 1).toFixed(2)}</span>
+          </label>
+          <label style={lab}>
             Projection
             <input
               type="range"
@@ -270,6 +291,20 @@ function Panel({
             <span>{v.projection.toFixed(3)}</span>
           </label>
           <label style={lab}>
+            Thread depth scale
+            <input
+              type="range"
+              min={0.25}
+              max={4}
+              step={0.025}
+              value={v.visorThreadingScale ?? 1}
+              onChange={(e) =>
+                setVisor({ visorThreadingScale: Number(e.target.value) })
+              }
+            />
+            <span>{(v.visorThreadingScale ?? 1).toFixed(3)}</span>
+          </label>
+          <label style={lab}>
             Half-span (max, rad)
             <input
               type="range"
@@ -277,7 +312,9 @@ function Panel({
               max={1.35}
               step={0.005}
               value={v.halfSpanRad}
-              onChange={(e) => setVisor({ halfSpanRad: Number(e.target.value) })}
+              onChange={(e) =>
+                setVisor({ halfSpanRad: Number(e.target.value) })
+              }
             />
             <span>{v.halfSpanRad.toFixed(3)}</span>
           </label>
@@ -318,7 +355,10 @@ function Panel({
               step={0.05}
               value={v.superellipseN}
               onChange={(e) =>
-                setVisor({ superellipseN: Number(e.target.value), mode: "superellipse" })
+                setVisor({
+                  superellipseN: Number(e.target.value),
+                  mode: "superellipse",
+                })
               }
             />
             <span>{v.superellipseN.toFixed(2)}</span>
@@ -374,7 +414,8 @@ function Panel({
                               mt.frontSeamMode === m
                                 ? "1px solid #3b82f6"
                                 : "1px solid #374151",
-                            background: mt.frontSeamMode === m ? "#1e3a5f" : "#1f2937",
+                            background:
+                              mt.frontSeamMode === m ? "#1e3a5f" : "#1f2937",
                             color: "#e5e7eb",
                             cursor: "pointer",
                             fontSize: 11,
@@ -394,9 +435,13 @@ function Panel({
                             min={0.01}
                             value={mt.seamFrontBaseLengthM}
                             style={hiInput("seamFront")}
-                            onFocus={() => onMeasurementHighlightChange("seamFront")}
+                            onFocus={() =>
+                              onMeasurementHighlightChange("seamFront")
+                            }
                             onChange={(e) =>
-                              setMt({ seamFrontBaseLengthM: Number(e.target.value) })
+                              setMt({
+                                seamFrontBaseLengthM: Number(e.target.value),
+                              })
                             }
                           />
                         </label>
@@ -408,9 +453,13 @@ function Panel({
                             min={0.01}
                             value={mt.seamFrontTopLengthM}
                             style={hiInput("seamFront")}
-                            onFocus={() => onMeasurementHighlightChange("seamFront")}
+                            onFocus={() =>
+                              onMeasurementHighlightChange("seamFront")
+                            }
                             onChange={(e) =>
-                              setMt({ seamFrontTopLengthM: Number(e.target.value) })
+                              setMt({
+                                seamFrontTopLengthM: Number(e.target.value),
+                              })
                             }
                           />
                         </label>
@@ -452,7 +501,11 @@ function Panel({
                                   })
                                 }
                               />
-                              <span>{(spec.frontVSplit.legBottomStrength ?? 0).toFixed(2)}</span>
+                              <span>
+                                {(
+                                  spec.frontVSplit.legBottomStrength ?? 0
+                                ).toFixed(2)}
+                              </span>
                             </label>
                             <label style={lab}>
                               V leg bulge (V → top)
@@ -471,7 +524,11 @@ function Panel({
                                   })
                                 }
                               />
-                              <span>{(spec.frontVSplit.legTopStrength ?? 0).toFixed(2)}</span>
+                              <span>
+                                {(spec.frontVSplit.legTopStrength ?? 0).toFixed(
+                                  2,
+                                )}
+                              </span>
                             </label>
                           </>
                         )}
@@ -485,14 +542,18 @@ function Panel({
                           min={0.02}
                           value={mt.seamEdgeLengthFrontM}
                           style={hiInput("seamFront")}
-                          onFocus={() => onMeasurementHighlightChange("seamFront")}
+                          onFocus={() =>
+                            onMeasurementHighlightChange("seamFront")
+                          }
                           onChange={(e) =>
-                            setMt({ seamEdgeLengthFrontM: Number(e.target.value) })
+                            setMt({
+                              seamEdgeLengthFrontM: Number(e.target.value),
+                            })
                           }
                         />
                       </label>
                     )}
-                    {spec.fivePanelCenterSeamLength < 1 && (
+                    {spec.crownPanelMode === 5 && (
                       <label style={{ ...lab, marginTop: 8 }}>
                         Front center seam length (from top, 5-panel)
                         <input
@@ -502,10 +563,14 @@ function Panel({
                           step={0.01}
                           value={spec.fivePanelCenterSeamLength}
                           onChange={(e) =>
-                            set({ fivePanelCenterSeamLength: Number(e.target.value) })
+                            set({
+                              fivePanelCenterSeamLength: Number(e.target.value),
+                            })
                           }
                         />
-                        <span>{(spec.fivePanelCenterSeamLength * 100).toFixed(0)}%</span>
+                        <span>
+                          {(spec.fivePanelCenterSeamLength * 100).toFixed(0)}%
+                        </span>
                       </label>
                     )}
                   </div>
@@ -520,9 +585,13 @@ function Panel({
                       min={0.02}
                       value={mt.seamEdgeLengthSideFrontM}
                       style={hiInput("seamSideFront")}
-                      onFocus={() => onMeasurementHighlightChange("seamSideFront")}
+                      onFocus={() =>
+                        onMeasurementHighlightChange("seamSideFront")
+                      }
                       onChange={(e) =>
-                        setMt({ seamEdgeLengthSideFrontM: Number(e.target.value) })
+                        setMt({
+                          seamEdgeLengthSideFrontM: Number(e.target.value),
+                        })
                       }
                     />
                   </label>
@@ -536,9 +605,13 @@ function Panel({
                       min={0.02}
                       value={mt.seamEdgeLengthSideBackM}
                       style={hiInput("seamSideBack")}
-                      onFocus={() => onMeasurementHighlightChange("seamSideBack")}
+                      onFocus={() =>
+                        onMeasurementHighlightChange("seamSideBack")
+                      }
                       onChange={(e) =>
-                        setMt({ seamEdgeLengthSideBackM: Number(e.target.value) })
+                        setMt({
+                          seamEdgeLengthSideBackM: Number(e.target.value),
+                        })
                       }
                     />
                   </label>
@@ -572,7 +645,7 @@ function Panel({
                       set(
                         patchGroupEndpointStyle(spec, key, {
                           bottomStrength: Number(e.target.value),
-                        })
+                        }),
                       )
                     }
                   />
@@ -589,12 +662,15 @@ function Panel({
                     onChange={(e) =>
                       set(
                         patchGroupEndpointStyle(spec, key, {
-                          bottomAngleRad: ((Number(e.target.value) + 40) * Math.PI) / 180,
-                        })
+                          bottomAngleRad:
+                            ((Number(e.target.value) + 40) * Math.PI) / 180,
+                        }),
                       )
                     }
                   />
-                  <span>{Math.round((st.bottomAngleRad * 180) / Math.PI - 40)}°</span>
+                  <span>
+                    {Math.round((st.bottomAngleRad * 180) / Math.PI - 40)}°
+                  </span>
                 </label>
                 <label style={lab}>
                   Top strength
@@ -608,7 +684,7 @@ function Panel({
                       set(
                         patchGroupEndpointStyle(spec, key, {
                           topStrength: Number(e.target.value),
-                        })
+                        }),
                       )
                     }
                   />
@@ -625,12 +701,15 @@ function Panel({
                     onChange={(e) =>
                       set(
                         patchGroupEndpointStyle(spec, key, {
-                          topAngleRad: ((Number(e.target.value) - 45) * Math.PI) / 180,
-                        })
+                          topAngleRad:
+                            ((Number(e.target.value) - 45) * Math.PI) / 180,
+                        }),
                       )
                     }
                   />
-                  <span>{Math.round((st.topAngleRad * 180) / Math.PI + 45)}°</span>
+                  <span>
+                    {Math.round((st.topAngleRad * 180) / Math.PI + 45)}°
+                  </span>
                 </label>
               </div>
             );
@@ -706,7 +785,9 @@ function Panel({
           paddingTop: 10,
         }}
       >
-        <label style={{ ...lab, flexDirection: "row", alignItems: "center", gap: 8 }}>
+        <label
+          style={{ ...lab, flexDirection: "row", alignItems: "center", gap: 8 }}
+        >
           <input
             type="checkbox"
             checked={spec.backClosureOpening}
@@ -714,6 +795,52 @@ function Panel({
           />
           <span>Back closure opening</span>
         </label>
+        <div style={{ ...lab, marginTop: 8 }}>
+          <span style={{ fontWeight: 600 }}>Eyelets</span>
+          <div style={{ display: "flex", gap: 8 }}>
+            {(["none", "cloth", "metal"] as const satisfies readonly EyeletStyle[]).map(
+              (opt) => {
+                const active = spec.eyeletStyle === opt;
+                return (
+                  <button
+                    key={opt}
+                    type="button"
+                    onClick={() => set({ eyeletStyle: opt })}
+                    style={{
+                      flex: 1,
+                      padding: "8px 10px",
+                      borderRadius: 6,
+                      border: active ? "1px solid #3b82f6" : "1px solid #374151",
+                      background: active ? "#1e3a5f" : "#1f2937",
+                      color: "#e5e7eb",
+                      cursor: "pointer",
+                      fontSize: 12,
+                      textTransform: "capitalize",
+                    }}
+                  >
+                    {opt}
+                  </button>
+                );
+              },
+            )}
+          </div>
+        </div>
+        {spec.eyeletStyle !== "none" && (
+          <label style={lab}>
+            Eyelet drop from crown top (m)
+            <input
+              type="range"
+              min={0.02}
+              max={0.09}
+              step={0.001}
+              value={spec.eyeletDropFromTopM}
+              onChange={(e) =>
+                set({ eyeletDropFromTopM: Number(e.target.value) })
+              }
+            />
+            <span>{spec.eyeletDropFromTopM.toFixed(3)}</span>
+          </label>
+        )}
       </div>
       <button
         type="button"
@@ -748,18 +875,22 @@ const MEASUREMENT_SOLVE_DEBOUNCE_MS = 120;
 
 export function HatViewer() {
   const [spec, setSpecRaw] = useState<HatSkeletonSpec>(() =>
-    mergeHatSpecDefaults(defaultHatSkeletonSpec())
+    mergeHatSpecDefaults(defaultHatSkeletonSpec()),
   );
   const setSpec = useCallback((s: HatSkeletonSpec) => {
     setSpecRaw(mergeHatSpecDefaults(s));
   }, []);
-  const measurementSolveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const measurementSolveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const lastSolvedMeasurementTargetsRef = useRef<HatMeasurementTargets | null>(
-    measurementTargetsFromSpec(mergeHatSpecDefaults(defaultHatSkeletonSpec()))
+    measurementTargetsFromSpec(mergeHatSpecDefaults(defaultHatSkeletonSpec())),
   );
   const [measurementTargets, setMeasurementTargetsRaw] =
     useState<HatMeasurementTargets>(() =>
-      measurementTargetsFromSpec(mergeHatSpecDefaults(defaultHatSkeletonSpec()))
+      measurementTargetsFromSpec(
+        mergeHatSpecDefaults(defaultHatSkeletonSpec()),
+      ),
     );
   const setMeasurementTargets = useCallback((mt: HatMeasurementTargets) => {
     setMeasurementTargetsRaw(mt);
@@ -775,7 +906,7 @@ export function HatViewer() {
           return prev;
         }
         return mergeHatSpecDefaults(
-          solveHatSpecFromMeasurementsIncremental(prev, lastSolved, mt)
+          solveHatSpecFromMeasurementsIncremental(prev, lastSolved, mt),
         );
       });
     }, MEASUREMENT_SOLVE_DEBOUNCE_MS);
@@ -786,7 +917,7 @@ export function HatViewer() {
         clearTimeout(measurementSolveTimerRef.current);
       }
     },
-    []
+    [],
   );
 
   const deferredSpec = useDeferredValue(spec);
@@ -858,13 +989,21 @@ export function HatViewer() {
           dpr={[1, 2]}
         >
           <Suspense fallback={null}>
-            <PerspectiveCamera makeDefault position={[0.35, 0.45, 0.35]} fov={50} />
+            <PerspectiveCamera
+              makeDefault
+              position={[0.35, 0.45, 0.35]}
+              fov={50}
+              near={0.002}
+              far={40}
+            />
             <color attach="background" args={["#0f0f12"]} />
             <ambientLight intensity={0.55} />
             <directionalLight position={[5, 8, 10]} intensity={1.1} />
             <directionalLight position={[-4, 2, -3]} intensity={0.35} />
-            <HatModel spec={deferredSpec} measurementHighlight={measurementHighlight} />
-            <DebugThreadingVisibilityLog />
+            <HatModel
+              spec={deferredSpec}
+              measurementHighlight={measurementHighlight}
+            />
             <OrbitControls makeDefault enableDamping dampingFactor={0.08} />
           </Suspense>
         </Canvas>

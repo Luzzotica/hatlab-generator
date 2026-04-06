@@ -1,4 +1,9 @@
-import type { HatSkeletonSpec, PanelCount, SeamEndpointStyle, VisorSpec } from "./types";
+import type {
+  HatSkeletonSpec,
+  PanelCount,
+  SeamEndpointStyle,
+  VisorSpec,
+} from "./types";
 
 /** 3D point [x, y, z]; +Z up, +Y forward. */
 export type Vec3 = readonly [number, number, number];
@@ -96,7 +101,7 @@ export function sweatbandPoint(
   semiAxisX: number,
   semiAxisY: number,
   yawRad: number,
-  center: Vec3 = [0, 0, 0]
+  center: Vec3 = [0, 0, 0],
 ): [number, number, number] {
   const local: Vec3 = [
     semiAxisX * Math.cos(theta),
@@ -113,9 +118,13 @@ export function sweatbandTangentTheta(
   theta: number,
   semiAxisX: number,
   semiAxisY: number,
-  yawRad: number
+  yawRad: number,
 ): [number, number, number] {
-  const dLocal: Vec3 = [-semiAxisX * Math.sin(theta), semiAxisY * Math.cos(theta), 0];
+  const dLocal: Vec3 = [
+    -semiAxisX * Math.sin(theta),
+    semiAxisY * Math.cos(theta),
+    0,
+  ];
   const r = rotationZ(yawRad);
   const v = matVec(r, dLocal);
   const L = Math.hypot(v[0], v[1], v[2]);
@@ -132,7 +141,9 @@ export function rearCenterSeamIndex(nSeams: PanelCount): number {
  * Pairs of seam indices for interior cross seam tape meridians (BL→FR, BR→FL).
  * Uses {@link sampleVToArcGuideMeridian} with α = 0.5 between each pair.
  */
-export function crossSeamTapeIndices(nSeams: PanelCount): [[number, number], [number, number]] {
+export function crossSeamTapeIndices(
+  nSeams: PanelCount,
+): [[number, number], [number, number]] {
   if (nSeams === 6) {
     // Opposite side seams (not front/back center): forms an X on the interior.
     // Order: smaller index first so meridian math is stable (neither seam is front V).
@@ -157,7 +168,7 @@ export function topRimPoint(
   semiAxisY: number,
   yawRad: number,
   crownHeight: number,
-  fraction: number
+  fraction: number,
 ): [number, number, number] {
   const local: Vec3 = [
     semiAxisX * fraction * Math.cos(theta),
@@ -172,7 +183,7 @@ export function sweatbandTangent(
   theta: number,
   semiAxisX: number,
   semiAxisY: number,
-  yawRad: number
+  yawRad: number,
 ): [number, number, number] {
   const local: Vec3 = [
     -semiAxisX * Math.sin(theta),
@@ -214,7 +225,7 @@ export function panelSeamAngles(nSeams: PanelCount): Float64Array {
  */
 export function frontPanelRimThetaBounds(
   nSeams: PanelCount,
-  angles: Float64Array
+  angles: Float64Array,
 ): { lo: number; hi: number } {
   if (nSeams === 5) {
     return { lo: angles[0]!, hi: angles[1]! };
@@ -231,6 +242,21 @@ export function frontRisePanelIndices(nSeams: PanelCount): number[] {
 }
 
 /**
+ * Crown panels that receive ventilation eyelets. Uses {@link HatSkeletonSpec.crownPanelMode}
+ * (set when swapping 5/6 in the viewer).
+ *
+ * - **6-panel:** one per panel `[0…5]`.
+ * - **5-panel** (mode 5 or `nSeams === 5`): four eyelets on the non-front panels `[1,2,3,4]`
+ *   (panel `0` is the wide front; mesh still has six panels in the viewer).
+ */
+export function eyeletPanelIndices(spec: HatSkeletonSpec): number[] {
+  if (spec.nSeams === 5) return [1, 2, 3, 4];
+  const mode = spec.crownPanelMode ?? 6;
+  if (mode === 6) return [0, 1, 2, 3, 4, 5];
+  return [2, 3, 4, 5];
+}
+
+/**
  * Half-angle span (rad) for visor attach: min of user `halfSpanRad` and the front-panel
  * seam window, widened by `rimOutsetBeyondSeamRad` (past the side seams) and narrowed by
  * `rimInsetBehindSeamRad`.
@@ -238,7 +264,7 @@ export function frontRisePanelIndices(nSeams: PanelCount): number[] {
 export function effectiveVisorHalfSpanRad(
   visor: VisorSpec,
   nSeams: PanelCount,
-  angles: Float64Array
+  angles: Float64Array,
 ): number {
   const { lo, hi } = frontPanelRimThetaBounds(nSeams, angles);
   const frontHalf = 0.5 * (hi - lo);
@@ -252,7 +278,7 @@ export function seamQuadraticBezier(
   rim: Vec3,
   apex: Vec3,
   squareness: number,
-  bulgeScale = 1
+  bulgeScale = 1,
 ): [Vec3, Vec3, Vec3] {
   const p0: Vec3 = [rim[0], rim[1], rim[2]];
   const p2: Vec3 = [apex[0], apex[1], apex[2]];
@@ -288,7 +314,7 @@ export function solveVPoint(
   rim: Vec3,
   top: Vec3,
   Lbase: number,
-  Ltop: number
+  Ltop: number,
 ): [number, number, number] {
   const chord = sub(top, rim);
   const d = len(chord);
@@ -323,7 +349,7 @@ function evalVPath(
   top: Vec3,
   vPoint: Vec3,
   _tSplit: number,
-  t: number
+  t: number,
 ): [number, number, number] {
   const leg1 = len(sub(vPoint, rim));
   const leg2 = len(sub(top, vPoint));
@@ -340,7 +366,12 @@ function evalVPath(
   return add(scale(vPoint, 1 - u), scale(top, u)) as [number, number, number];
 }
 
-export function evalQuadraticBezier(p0: Vec3, p1: Vec3, p2: Vec3, t: number): [number, number, number] {
+export function evalQuadraticBezier(
+  p0: Vec3,
+  p1: Vec3,
+  p2: Vec3,
+  t: number,
+): [number, number, number] {
   const u = 1 - t;
   return [
     u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0],
@@ -354,7 +385,7 @@ export function evalCubicBezier(
   p1: Vec3,
   p2: Vec3,
   p3: Vec3,
-  t: number
+  t: number,
 ): [number, number, number] {
   const u = 1 - t;
   const u2 = u * u;
@@ -371,8 +402,12 @@ export function evalCubicBezier(
 /** Seam plane: +u from rim→top chord, +v outward bulge (matches `seamQuadraticBezier`). */
 export function seamPlaneFrameFromRimTop(
   rim: Vec3,
-  top: Vec3
-): { u: [number, number, number]; v: [number, number, number]; planeN: [number, number, number] } {
+  top: Vec3,
+): {
+  u: [number, number, number];
+  v: [number, number, number];
+  planeN: [number, number, number];
+} {
   const chord = sub(top, rim);
   const chordLen = len(chord);
   if (chordLen < 1e-15) throw new Error("rim and top coincide");
@@ -403,7 +438,7 @@ function bottomAngleMixBasis(
   planeN: Vec3,
   uChord: [number, number, number],
   vBulge: [number, number, number],
-  useVerticalAsE1: boolean
+  useVerticalAsE1: boolean,
 ): { e1: [number, number, number]; e2: [number, number, number] } {
   const e1 = useVerticalAsE1 ? verticalUpInSeamPlane(planeN) : uChord;
   const vProj = sub(vBulge as Vec3, scale(e1 as Vec3, dot(vBulge as Vec3, e1)));
@@ -416,7 +451,9 @@ function bottomAngleMixBasis(
 }
 
 /** Default cubic endpoint style matching legacy bulge scalar `squareness`. */
-export function defaultSeamEndpointStyleFromSquareness(squareness: number): SeamEndpointStyle {
+export function defaultSeamEndpointStyleFromSquareness(
+  squareness: number,
+): SeamEndpointStyle {
   const s = Math.min(1, Math.max(0, squareness));
   return {
     bottomStrength: s,
@@ -427,11 +464,7 @@ export function defaultSeamEndpointStyleFromSquareness(squareness: number): Seam
   };
 }
 
-function mix2d(
-  u: Vec3,
-  v: Vec3,
-  angleRad: number
-): [number, number, number] {
+function mix2d(u: Vec3, v: Vec3, angleRad: number): [number, number, number] {
   const ca = Math.cos(angleRad);
   const sa = Math.sin(angleRad);
   return norm([
@@ -441,14 +474,17 @@ function mix2d(
   ]) as [number, number, number];
 }
 
-function projectOntoPlaneUnnormalized(v: Vec3, planeN: Vec3): [number, number, number] {
+function projectOntoPlaneUnnormalized(
+  v: Vec3,
+  planeN: Vec3,
+): [number, number, number] {
   const nn = norm(planeN);
   return sub(v as Vec3, scale(nn, dot(v as Vec3, nn)));
 }
 
 function projectOntoPlaneDir(
   d: [number, number, number],
-  planeN: Vec3
+  planeN: Vec3,
 ): [number, number, number] {
   const proj = projectOntoPlaneUnnormalized(d as Vec3, planeN);
   const L = len(proj);
@@ -468,7 +504,9 @@ const SEAM_ARC_LENGTH_TOL_M = 0.00254;
 const SEAM_LAMBDA_MAX_ITERS = 5;
 
 /** Unit vector in XY toward the crown point from the z-axis (horizontal “out” on the top ring). */
-export function horizontalRadialOutFromAxisAtTop(top: Vec3): [number, number, number] {
+export function horizontalRadialOutFromAxisAtTop(
+  top: Vec3,
+): [number, number, number] {
   const x = top[0];
   const y = top[1];
   const r = Math.hypot(x, y);
@@ -481,7 +519,10 @@ export function horizontalRadialOutFromAxisAtTop(top: Vec3): [number, number, nu
  * z-axis (button / apex), the same direction as the rim point in XY. Using a fixed +X fallback for
  * all seams breaks mirror symmetry between left and right seams by a few mm of arc height.
  */
-export function horizontalRadialOutForSeamTop(top: Vec3, rim: Vec3): [number, number, number] {
+export function horizontalRadialOutForSeamTop(
+  top: Vec3,
+  rim: Vec3,
+): [number, number, number] {
   const x = top[0];
   const y = top[1];
   const r = Math.hypot(x, y);
@@ -503,7 +544,7 @@ export function horizontalRadialOutForSeamTop(top: Vec3, rim: Vec3): [number, nu
 function alignHandleWithChordForwardPreservingBulge(
   d: [number, number, number],
   uChord: [number, number, number],
-  vBulge: [number, number, number]
+  vBulge: [number, number, number],
 ): [number, number, number] {
   const uu = dot(d as Vec3, uChord);
   const vv = dot(d as Vec3, vBulge);
@@ -523,10 +564,15 @@ function alignHandleWithChordForwardPreservingBulge(
 export function seamHandleDirectionsFromStyle(
   rim: Vec3,
   top: Vec3,
-  style: SeamEndpointStyle
+  style: SeamEndpointStyle,
 ): { dBottom: [number, number, number]; dTop: [number, number, number] } {
   const { u, v, planeN } = seamPlaneFrameFromRimTop(rim, top);
-  const { e1, e2 } = bottomAngleMixBasis(planeN, u, v, style.lockAnglesToSeamPlane);
+  const { e1, e2 } = bottomAngleMixBasis(
+    planeN,
+    u,
+    v,
+    style.lockAnglesToSeamPlane,
+  );
   let d0 = mix2d(e1, e2, style.bottomAngleRad);
   let d1: [number, number, number];
   if (style.lockAnglesToSeamPlane) {
@@ -553,7 +599,7 @@ export function buildSeamCubicWithLambda(
   rim: Vec3,
   top: Vec3,
   style: SeamEndpointStyle,
-  lambda: number
+  lambda: number,
 ): [Vec3, Vec3, Vec3, Vec3] {
   const { dBottom, dTop } = seamHandleDirectionsFromStyle(rim, top, style);
   const p0: Vec3 = [rim[0], rim[1], rim[2]];
@@ -568,7 +614,7 @@ export function cubicBezierArcLength(
   p1: Vec3,
   p2: Vec3,
   p3: Vec3,
-  segments = CUBIC_ARC_LEN_SEGMENTS
+  segments = CUBIC_ARC_LEN_SEGMENTS,
 ): number {
   let L = 0;
   let prev = evalCubicBezier(p0, p1, p2, p3, 0);
@@ -588,30 +634,38 @@ export function solveLambdaForSeamCubicArcLength(
   rim: Vec3,
   top: Vec3,
   style: SeamEndpointStyle,
-  targetLength: number
+  targetLength: number,
 ): number {
   const chord = len(sub(top, rim));
   if (chord < 1e-15) return 0;
-  const L0 = cubicBezierArcLength(...buildSeamCubicWithLambda(rim, top, style, 0));
+  const L0 = cubicBezierArcLength(
+    ...buildSeamCubicWithLambda(rim, top, style, 0),
+  );
   if (targetLength <= L0 + 1e-9) return 0;
 
   let hi = 1;
   for (let k = 0; k < 6; k++) {
-    const L = cubicBezierArcLength(...buildSeamCubicWithLambda(rim, top, style, hi));
+    const L = cubicBezierArcLength(
+      ...buildSeamCubicWithLambda(rim, top, style, hi),
+    );
     if (L >= targetLength) break;
     hi *= 2;
     if (hi > 1e6) break;
   }
 
   let lo = 0;
-  const hiL = cubicBezierArcLength(...buildSeamCubicWithLambda(rim, top, style, hi));
+  const hiL = cubicBezierArcLength(
+    ...buildSeamCubicWithLambda(rim, top, style, hi),
+  );
   if (hiL < targetLength) {
     return hi;
   }
 
   for (let i = 0; i < SEAM_LAMBDA_MAX_ITERS; i++) {
     const mid = 0.5 * (lo + hi);
-    const L = cubicBezierArcLength(...buildSeamCubicWithLambda(rim, top, style, mid));
+    const L = cubicBezierArcLength(
+      ...buildSeamCubicWithLambda(rim, top, style, mid),
+    );
     if (Math.abs(L - targetLength) <= SEAM_ARC_LENGTH_TOL_M) {
       return mid;
     }
@@ -625,14 +679,23 @@ export function buildSeamCubicControlPoints(
   rim: Vec3,
   top: Vec3,
   style: SeamEndpointStyle,
-  targetArcLength: number
+  targetArcLength: number,
 ): [Vec3, Vec3, Vec3, Vec3] {
-  const lam = solveLambdaForSeamCubicArcLength(rim, top, style, targetArcLength);
+  const lam = solveLambdaForSeamCubicArcLength(
+    rim,
+    top,
+    style,
+    targetArcLength,
+  );
   return buildSeamCubicWithLambda(rim, top, style, lam);
 }
 
 /** Unit normal for the plane containing rim, vPoint, top (front V). */
-export function vSplitPlaneNormal(rim: Vec3, vPoint: Vec3, top: Vec3): [number, number, number] {
+export function vSplitPlaneNormal(
+  rim: Vec3,
+  vPoint: Vec3,
+  top: Vec3,
+): [number, number, number] {
   const a = sub(vPoint, rim);
   const b = sub(top, vPoint);
   let n = cross(a, b);
@@ -645,12 +708,16 @@ function quadLegInPlane(
   p0: Vec3,
   p2: Vec3,
   strength: number,
-  planeN: Vec3
+  planeN: Vec3,
 ): [Vec3, Vec3, Vec3] {
   const chord = sub(p2, p0);
   const L = len(chord);
   if (L < 1e-15) {
-    return [[p0[0], p0[1], p0[2]], [p0[0], p0[1], p0[2]], [p2[0], p2[1], p2[2]]];
+    return [
+      [p0[0], p0[1], p0[2]],
+      [p0[0], p0[1], p0[2]],
+      [p2[0], p2[1], p2[2]],
+    ];
   }
   const uDir = scale(chord, 1 / L);
   let perp = cross(planeN, uDir);
@@ -667,7 +734,7 @@ export function buildVSplitQuadraticLegs(
   top: Vec3,
   vPoint: Vec3,
   legBottomStrength: number,
-  legTopStrength: number
+  legTopStrength: number,
 ): { lower: [Vec3, Vec3, Vec3]; upper: [Vec3, Vec3, Vec3]; tSplit: number } {
   const planeN = vSplitPlaneNormal(rim, vPoint, top);
   const lower = quadLegInPlane(rim, vPoint, legBottomStrength, planeN);
@@ -683,15 +750,24 @@ function evalVQuadraticLegsAt(
   lower: [Vec3, Vec3, Vec3],
   upper: [Vec3, Vec3, Vec3],
   tSplit: number,
-  t: number
+  t: number,
 ): [number, number, number] {
   if (t <= tSplit + 1e-15) {
     const u = tSplit < 1e-12 ? 0 : t / tSplit;
-    return evalQuadraticBezier(lower[0], lower[1], lower[2], Math.min(1, Math.max(0, u)));
+    return evalQuadraticBezier(
+      lower[0],
+      lower[1],
+      lower[2],
+      Math.min(1, Math.max(0, u)),
+    );
   }
-  const u =
-    1 - tSplit < 1e-12 ? 1 : (t - tSplit) / (1 - tSplit);
-  return evalQuadraticBezier(upper[0], upper[1], upper[2], Math.min(1, Math.max(0, u)));
+  const u = 1 - tSplit < 1e-12 ? 1 : (t - tSplit) / (1 - tSplit);
+  return evalQuadraticBezier(
+    upper[0],
+    upper[1],
+    upper[2],
+    Math.min(1, Math.max(0, u)),
+  );
 }
 
 /** Polyline length of a quadratic Bézier (uniform t samples). */
@@ -699,7 +775,7 @@ export function quadraticBezierArcLength(
   p0: Vec3,
   p1: Vec3,
   p2: Vec3,
-  segments = ARC_LEN_SEGMENTS
+  segments = ARC_LEN_SEGMENTS,
 ): number {
   let L = 0;
   let prev = evalQuadraticBezier(p0, p1, p2, 0);
@@ -713,7 +789,11 @@ export function quadraticBezierArcLength(
 }
 
 /** Arc length of the seam quadratic from `rim` to `top` at the given squareness. */
-export function arcLengthOfSeamQuadratic(rim: Vec3, top: Vec3, squareness: number): number {
+export function arcLengthOfSeamQuadratic(
+  rim: Vec3,
+  top: Vec3,
+  squareness: number,
+): number {
   const [p0, p1, p2] = seamQuadraticBezier(rim, top, squareness);
   return quadraticBezierArcLength(p0, p1, p2);
 }
@@ -725,7 +805,7 @@ export function arcLengthOfSeamQuadratic(rim: Vec3, top: Vec3, squareness: numbe
 export function solveSquarenessForArcLengthMultiplier(
   rim: Vec3,
   top: Vec3,
-  multiplier: number
+  multiplier: number,
 ): number {
   const chord = len(sub(top, rim));
   if (chord < 1e-12) return 0;
@@ -751,7 +831,7 @@ export function subdivideQuadraticBezier(
   p0: Vec3,
   p1: Vec3,
   p2: Vec3,
-  t: number
+  t: number,
 ): { left: [Vec3, Vec3, Vec3]; right: [Vec3, Vec3, Vec3] } {
   const b01: [number, number, number] = [
     (1 - t) * p0[0] + t * p1[0],
@@ -779,7 +859,7 @@ export function buildSplitSeamCurve(
   apex: Vec3,
   sVisor: number,
   sCrown: number,
-  tSplit: number
+  tSplit: number,
 ): SeamCurve {
   const ts = Math.min(0.999, Math.max(0.001, tSplit));
   const [p0, p1, p2] = seamQuadraticBezier(rim, apex, sVisor);
@@ -789,7 +869,10 @@ export function buildSplitSeamCurve(
   return { kind: "split", tSplit: ts, left, right: rightSeg };
 }
 
-export function evalSeamCurve(curve: SeamCurve, t: number): [number, number, number] {
+export function evalSeamCurve(
+  curve: SeamCurve,
+  t: number,
+): [number, number, number] {
   if (curve.kind === "bezier") {
     const [p0, p1, p2] = curve.ctrl;
     return evalQuadraticBezier(p0, p1, p2, t);
@@ -803,13 +886,32 @@ export function evalSeamCurve(curve: SeamCurve, t: number): [number, number, num
     return evalSeamSuperellipse(rim, top, n, bulgeFraction, t);
   }
   if (curve.kind === "vSplit") {
-    const { rim, top, vPoint, blend, baseCurve, tSplit, legBottomStrength, legTopStrength } = curve;
+    const {
+      rim,
+      top,
+      vPoint,
+      blend,
+      baseCurve,
+      tSplit,
+      legBottomStrength,
+      legTopStrength,
+    } = curve;
     const vPos =
       legBottomStrength <= 1e-12 && legTopStrength <= 1e-12
         ? evalVPath(rim, top, vPoint, tSplit, t)
-        : evalVQuadraticLegsAt(curve.lowerQuad, curve.upperQuad, curve.arcLenTSplit, t);
+        : evalVQuadraticLegsAt(
+            curve.lowerQuad,
+            curve.upperQuad,
+            curve.arcLenTSplit,
+            t,
+          );
     if (blend >= 1 - 1e-9) return vPos;
-    const bPos = evalQuadraticBezier(baseCurve[0], baseCurve[1], baseCurve[2], t);
+    const bPos = evalQuadraticBezier(
+      baseCurve[0],
+      baseCurve[1],
+      baseCurve[2],
+      t,
+    );
     if (blend <= 1e-9) return bPos;
     return [
       bPos[0] + blend * (vPos[0] - bPos[0]),
@@ -828,7 +930,7 @@ export function evalSeamCurve(curve: SeamCurve, t: number): [number, number, num
 
 export function sampleSeamCurve(
   curve: SeamCurve,
-  segments: number
+  segments: number,
 ): [number, number, number][] {
   const pts: [number, number, number][] = [];
   for (let i = 0; i <= segments; i++) {
@@ -843,7 +945,7 @@ export function sampleSeamCurve(
  */
 export function sampleSeamWireframe(
   curve: SeamCurve,
-  segments: number
+  segments: number,
 ): [number, number, number][] {
   if (curve.kind === "vSplit") {
     return sampleSeamCurve({ ...curve, blend: 1 }, segments);
@@ -851,16 +953,22 @@ export function sampleSeamWireframe(
   return sampleSeamCurve(curve, segments);
 }
 
-/** Same as {@link sampleSeamWireframe} but only samples `t ∈ [0, tMax]` (e.g. stop below the button ring). */
-export function sampleSeamWireframeTo(
+/**
+ * Samples `t ∈ [tMin, tMax]` along the seam (rim → apex). Use a positive `tMin` to shorten
+ * tape/thread from the rim toward the crown.
+ */
+export function sampleSeamWireframeRange(
   curve: SeamCurve,
   segments: number,
-  tMax: number
+  tMin: number,
+  tMax: number,
 ): [number, number, number][] {
-  const tEnd = Math.max(0, Math.min(1, tMax));
+  const t0 = Math.max(0, Math.min(1, tMin));
+  const t1 = Math.max(0, Math.min(1, tMax));
+  if (t1 <= t0 + 1e-12) return [];
   const pts: [number, number, number][] = [];
   for (let i = 0; i <= segments; i++) {
-    const t = (i / segments) * tEnd;
+    const t = t0 + (i / segments) * (t1 - t0);
     if (curve.kind === "vSplit") {
       pts.push(evalSeamCurve({ ...curve, blend: 1 }, t));
     } else {
@@ -868,6 +976,15 @@ export function sampleSeamWireframeTo(
     }
   }
   return pts;
+}
+
+/** Same as {@link sampleSeamWireframe} but only samples `t ∈ [0, tMax]` (e.g. stop below the button ring). */
+export function sampleSeamWireframeTo(
+  curve: SeamCurve,
+  segments: number,
+  tMax: number,
+): [number, number, number][] {
+  return sampleSeamWireframeRange(curve, segments, 0, tMax);
 }
 
 /** V seam curve for meridian / mesh lerp: uses `frontVSplit.blend` (V strength), not wireframe blend 1. */
@@ -887,7 +1004,7 @@ export function frontCenterSeamIndex(nSeams: number): number {
 export function frontGuideArcAndVIndices(
   panelIdx: number,
   frontSeamIdx: number,
-  nSeams: number
+  nSeams: number,
 ): [number, number] {
   const leftSeam = panelIdx;
   const rightSeam = (panelIdx + 1) % nSeams;
@@ -903,7 +1020,7 @@ export function frontGuideAlpha(
   j: number,
   M: number,
   frontSeamIdx: number,
-  nSeams: number
+  nSeams: number,
 ): number {
   const rightSeam = (panelIdx + 1) % nSeams;
   return rightSeam === frontSeamIdx ? j / M : 1 - j / M;
@@ -918,7 +1035,7 @@ export function evalVToArcGuideMeridianAt(
   seamArcIdx: number,
   seamVIdx: number,
   alpha: number,
-  u: number
+  u: number,
 ): [number, number, number] {
   const a = Math.max(0, Math.min(1, alpha));
   const t = Math.max(0, Math.min(1, u));
@@ -930,7 +1047,12 @@ export function evalVToArcGuideMeridianAt(
   const thetaV = sk.angles[seamVIdx]!;
   const thetaMix = (1 - a) * thetaA + a * thetaV;
 
-  const rim = sweatbandPoint(thetaMix, spec.semiAxisX, spec.semiAxisY, spec.yawRad);
+  const rim = sweatbandPoint(
+    thetaMix,
+    spec.semiAxisX,
+    spec.semiAxisY,
+    spec.yawRad,
+  );
   const topFrac = spec.topRimFraction ?? 0;
   const top: [number, number, number] =
     topFrac <= 1e-12
@@ -941,7 +1063,7 @@ export function evalVToArcGuideMeridianAt(
           spec.semiAxisY,
           spec.yawRad,
           spec.crownHeight,
-          topFrac
+          topFrac,
         );
 
   const pA0 = evalSeamCurve(seamA, 0);
@@ -955,8 +1077,16 @@ export function evalVToArcGuideMeridianAt(
   const naive0z = (1 - a) * pA0[2] + a * pV0[2];
   const naive1z = (1 - a) * pA1[2] + a * pV1[2];
 
-  const rimCorr: [number, number, number] = [rim[0] - naive0, rim[1] - naive0y, rim[2] - naive0z];
-  const topCorr: [number, number, number] = [top[0] - naive1, top[1] - naive1y, top[2] - naive1z];
+  const rimCorr: [number, number, number] = [
+    rim[0] - naive0,
+    rim[1] - naive0y,
+    rim[2] - naive0z,
+  ];
+  const topCorr: [number, number, number] = [
+    top[0] - naive1,
+    top[1] - naive1y,
+    top[2] - naive1z,
+  ];
 
   const pA = evalSeamCurve(seamA, t);
   const pV = evalSeamCurve(seamV, t);
@@ -986,7 +1116,7 @@ export function sampleVToArcGuideMeridian(
   seamArcIdx: number,
   seamVIdx: number,
   alpha: number,
-  N: number
+  N: number,
 ): [number, number, number][] {
   const pts: [number, number, number][] = [];
   for (let k = 0; k <= N; k++) {
@@ -996,13 +1126,17 @@ export function sampleVToArcGuideMeridian(
 }
 
 /** Resolved bulge for seam `i` (overrides > 6-panel groups > global). */
-export function effectiveSquarenessForSeam(spec: HatSkeletonSpec, seamIndex: number): number {
+export function effectiveSquarenessForSeam(
+  spec: HatSkeletonSpec,
+  seamIndex: number,
+): number {
   const o = spec.seamSquarenessOverrides[seamIndex];
   if (o !== null && o !== undefined) return Math.min(1, Math.max(0, o));
   if (spec.nSeams === 6 && spec.sixPanelSeams !== null) {
     const m = spec.sixPanelSeams;
     if (seamIndex === 1) return Math.min(1, Math.max(0, m.front));
-    if (seamIndex === 0 || seamIndex === 2) return Math.min(1, Math.max(0, m.sideFront));
+    if (seamIndex === 0 || seamIndex === 2)
+      return Math.min(1, Math.max(0, m.sideFront));
     return Math.min(1, Math.max(0, m.back));
   }
   return Math.min(1, Math.max(0, spec.seamSquareness));
@@ -1010,13 +1144,15 @@ export function effectiveSquarenessForSeam(spec: HatSkeletonSpec, seamIndex: num
 
 export function resolveSeamEndpointStyleForIndex(
   spec: HatSkeletonSpec,
-  seamIndex: number
+  seamIndex: number,
 ): SeamEndpointStyle {
   const eps = spec.seamEndpointStyles;
   if (eps.length > seamIndex && eps[seamIndex]) {
     return eps[seamIndex]!;
   }
-  return defaultSeamEndpointStyleFromSquareness(effectiveSquarenessForSeam(spec, seamIndex));
+  return defaultSeamEndpointStyleFromSquareness(
+    effectiveSquarenessForSeam(spec, seamIndex),
+  );
 }
 
 /** Target arc length (m) for cubic seam: explicit, else legacy quadratic length at current squareness. */
@@ -1024,10 +1160,14 @@ export function resolveSeamTargetArcLengthForIndex(
   spec: HatSkeletonSpec,
   seamIndex: number,
   rim: Vec3,
-  top: Vec3
+  top: Vec3,
 ): number {
   const arr = spec.seamTargetArcLengthM;
-  if (arr.length > seamIndex && arr[seamIndex] != null && arr[seamIndex]! > 1e-12) {
+  if (
+    arr.length > seamIndex &&
+    arr[seamIndex] != null &&
+    arr[seamIndex]! > 1e-12
+  ) {
     return arr[seamIndex]!;
   }
   const s = effectiveSquarenessForSeam(spec, seamIndex);
@@ -1037,7 +1177,7 @@ export function resolveSeamTargetArcLengthForIndex(
 export function blendSeamEndpointStyles(
   a: SeamEndpointStyle,
   b: SeamEndpointStyle,
-  t: number
+  t: number,
 ): SeamEndpointStyle {
   const w = Math.max(0, Math.min(1, t));
   return {
@@ -1045,23 +1185,33 @@ export function blendSeamEndpointStyles(
     bottomAngleRad: a.bottomAngleRad * (1 - w) + b.bottomAngleRad * w,
     topStrength: a.topStrength * (1 - w) + b.topStrength * w,
     topAngleRad: a.topAngleRad * (1 - w) + b.topAngleRad * w,
-    lockAnglesToSeamPlane: w < 0.5 ? a.lockAnglesToSeamPlane : b.lockAnglesToSeamPlane,
+    lockAnglesToSeamPlane:
+      w < 0.5 ? a.lockAnglesToSeamPlane : b.lockAnglesToSeamPlane,
   };
 }
 
 export function seamSquarenessForIndex(
   base: number,
   overrides: (number | null)[],
-  i: number
+  i: number,
 ): number {
-  if (overrides.length > i && overrides[i] !== null && overrides[i] !== undefined) {
+  if (
+    overrides.length > i &&
+    overrides[i] !== null &&
+    overrides[i] !== undefined
+  ) {
     return Math.min(1, Math.max(0, overrides[i]!));
   }
   return Math.min(1, Math.max(0, base));
 }
 
 /** Same as visor `visorOuterPolyline`: `s ∈ [-1,1]` along chord, bulge perpendicular. */
-export function superellipseOffset(s: number, a: number, b: number, n: number): [number, number] {
+export function superellipseOffset(
+  s: number,
+  a: number,
+  b: number,
+  n: number,
+): [number, number] {
   const sc = Math.max(-1, Math.min(1, s));
   const lx = a * sc;
   const inside = Math.max(0, 1 - Math.abs(sc) ** n);
@@ -1078,7 +1228,7 @@ export function evalSeamSuperellipse(
   top: Vec3,
   superN: number,
   bulgeFraction: number,
-  t: number
+  t: number,
 ): [number, number, number] {
   const p0: Vec3 = [rim[0], rim[1], rim[2]];
   const p2: Vec3 = [top[0], top[1], top[2]];
@@ -1134,8 +1284,18 @@ export function sampleVisorSuperellipsePolyline(
 ): [number, number, number][] {
   const { aScale, bScale, sMin, sMax, samples: mIn } = options;
   const c = spec.attachAngleRad;
-  const left = sweatbandPoint(c - spec.halfSpanRad, semiAxisX, semiAxisY, yawRad);
-  const right = sweatbandPoint(c + spec.halfSpanRad, semiAxisX, semiAxisY, yawRad);
+  const left = sweatbandPoint(
+    c - spec.halfSpanRad,
+    semiAxisX,
+    semiAxisY,
+    yawRad,
+  );
+  const right = sweatbandPoint(
+    c + spec.halfSpanRad,
+    semiAxisX,
+    semiAxisY,
+    yawRad,
+  );
   /** Chord midpoint and unit along the sweatband from left → right (matches rim attach, unlike center ± a·t̂ on an ellipse). */
   const rimMid = scale(add(left, right), 0.5);
   const chord = sub(right, left);
@@ -1167,7 +1327,7 @@ export function visorOuterPolyline(
   semiAxisX: number,
   semiAxisY: number,
   yawRad: number,
-  spec: VisorSpec
+  spec: VisorSpec,
 ): [number, number, number][] {
   const m = Math.max(8, spec.samples);
   return sampleVisorSuperellipsePolyline(semiAxisX, semiAxisY, yawRad, spec, {
@@ -1188,6 +1348,24 @@ export interface BuiltSkeleton {
   visorPolyline: [number, number, number][];
 }
 
+/**
+ * Sine bell along the visor angular span: 0 at tips, 1 at center front.
+ * Used to lift front-rise crown vertices with the visor curve.
+ */
+export function visorFrontBellAtTheta(
+  sk: BuiltSkeleton,
+  theta: number,
+): number {
+  const v = sk.spec.visor;
+  const halfSpan = effectiveVisorHalfSpanRad(v, sk.spec.nSeams, sk.angles);
+  const c = v.attachAngleRad;
+  let delta = theta - c;
+  delta = ((delta + Math.PI) % (2 * Math.PI)) - Math.PI;
+  if (Math.abs(delta) > halfSpan + 1e-9) return 0;
+  const s = (delta + halfSpan) / (2 * halfSpan);
+  return Math.sin(Math.PI * s);
+}
+
 const SEAM_REUSE_VEC_EPS = 1e-7;
 const SEAM_REUSE_LEN_EPS = 1e-6;
 
@@ -1199,7 +1377,10 @@ function vec3Close(a: Vec3, b: Vec3, eps: number): boolean {
   );
 }
 
-function seamEndpointStylesEqual(a: SeamEndpointStyle, b: SeamEndpointStyle): boolean {
+function seamEndpointStylesEqual(
+  a: SeamEndpointStyle,
+  b: SeamEndpointStyle,
+): boolean {
   const e = SEAM_REUSE_LEN_EPS;
   return (
     Math.abs(a.bottomStrength - b.bottomStrength) <= e &&
@@ -1211,7 +1392,11 @@ function seamEndpointStylesEqual(a: SeamEndpointStyle, b: SeamEndpointStyle): bo
 }
 
 /** Top endpoint for panel `i`; must match `buildSkeleton` seam top logic. */
-function seamTopEndForSpec(spec: HatSkeletonSpec, angles: Float64Array, i: number): Vec3 {
+function seamTopEndForSpec(
+  spec: HatSkeletonSpec,
+  angles: Float64Array,
+  i: number,
+): Vec3 {
   const topFrac = spec.topRimFraction;
   if (topFrac <= 1e-12) {
     return [0, 0, spec.crownHeight];
@@ -1222,7 +1407,7 @@ function seamTopEndForSpec(spec: HatSkeletonSpec, angles: Float64Array, i: numbe
     spec.semiAxisY,
     spec.yawRad,
     spec.crownHeight,
-    topFrac
+    topFrac,
   ) as Vec3;
 }
 
@@ -1234,10 +1419,14 @@ function canReuseCubicSeamFromPrev(
   rim: Vec3,
   topEnd: Vec3,
   useArcLength: boolean,
-  useSuperellipse: boolean
+  useSuperellipse: boolean,
 ): boolean {
   if (useArcLength || useSuperellipse) return false;
-  if (spec.seamCurveMode !== "squareness" || prev.spec.seamCurveMode !== "squareness") return false;
+  if (
+    spec.seamCurveMode !== "squareness" ||
+    prev.spec.seamCurveMode !== "squareness"
+  )
+    return false;
   const pc = prev.seamControls[i];
   if (!pc || pc.kind !== "cubic") return false;
   if (!vec3Close(rim, prev.rimPoints[i]!, SEAM_REUSE_VEC_EPS)) return false;
@@ -1247,13 +1436,18 @@ function canReuseCubicSeamFromPrev(
   const pst = resolveSeamEndpointStyleForIndex(prev.spec, i);
   if (!seamEndpointStylesEqual(st, pst)) return false;
   const t1 = resolveSeamTargetArcLengthForIndex(spec, i, rim, topEnd);
-  const t2 = resolveSeamTargetArcLengthForIndex(prev.spec, i, prev.rimPoints[i]!, prevTop);
+  const t2 = resolveSeamTargetArcLengthForIndex(
+    prev.spec,
+    i,
+    prev.rimPoints[i]!,
+    prevTop,
+  );
   return Math.abs(t1 - t2) <= SEAM_REUSE_LEN_EPS;
 }
 
 export function sweatbandPolyline(
   spec: HatSkeletonSpec,
-  samples: number
+  samples: number,
 ): [number, number, number][] {
   const out: [number, number, number][] = [];
   const step = (2 * Math.PI) / samples;
@@ -1266,14 +1460,14 @@ export function sweatbandPolyline(
 
 export function sampleSeam(
   controls: [Vec3, Vec3, Vec3],
-  segments: number
+  segments: number,
 ): [number, number, number][] {
   return sampleSeamCurve({ kind: "bezier", ctrl: controls }, segments);
 }
 
 export function buildSkeleton(
   spec: HatSkeletonSpec,
-  prevBuilt?: BuiltSkeleton | null
+  prevBuilt?: BuiltSkeleton | null,
 ): BuiltSkeleton {
   const prev =
     prevBuilt &&
@@ -1291,7 +1485,7 @@ export function buildSkeleton(
   const rimPoints: [number, number, number][] = [];
   for (let i = 0; i < spec.nSeams; i++) {
     rimPoints.push(
-      sweatbandPoint(angles[i]!, spec.semiAxisX, spec.semiAxisY, spec.yawRad)
+      sweatbandPoint(angles[i]!, spec.semiAxisX, spec.semiAxisY, spec.yawRad),
     );
   }
 
@@ -1306,7 +1500,7 @@ export function buildSkeleton(
       spec.semiAxisY,
       spec.yawRad,
       spec.crownHeight,
-      topFrac
+      topFrac,
     );
     return t as Vec3;
   };
@@ -1325,13 +1519,11 @@ export function buildSkeleton(
       const tSplit = totalL > 1e-12 ? vs.baseLengthM / totalL : 0.5;
       const lb = vs.legBottomStrength ?? 0;
       const lt = vs.legTopStrength ?? 0;
-      const { lower, upper, tSplit: arcLenTSplit } = buildVSplitQuadraticLegs(
-        rim,
-        topEnd,
-        vs.vPoint,
-        lb,
-        lt
-      );
+      const {
+        lower,
+        upper,
+        tSplit: arcLenTSplit,
+      } = buildVSplitQuadraticLegs(rim, topEnd, vs.vPoint, lb, lt);
       seamControls.push({
         kind: "vSplit",
         rim,
@@ -1353,9 +1545,12 @@ export function buildSkeleton(
       const s = solveSquarenessForArcLengthMultiplier(
         rim,
         topEnd,
-        spec.seamArcLengthMultiplier
+        spec.seamArcLengthMultiplier,
       );
-      seamControls.push({ kind: "bezier", ctrl: seamQuadraticBezier(rim, topEnd, s) });
+      seamControls.push({
+        kind: "bezier",
+        ctrl: seamQuadraticBezier(rim, topEnd, s),
+      });
     } else if (useSuperellipse) {
       const bulge = effectiveSquarenessForSeam(spec, i);
       seamControls.push({
@@ -1367,10 +1562,24 @@ export function buildSkeleton(
       });
     } else {
       const style = resolveSeamEndpointStyleForIndex(spec, i);
-      const targetLen = resolveSeamTargetArcLengthForIndex(spec, i, rim, topEnd);
+      const targetLen = resolveSeamTargetArcLengthForIndex(
+        spec,
+        i,
+        rim,
+        topEnd,
+      );
       if (
         prev &&
-        canReuseCubicSeamFromPrev(prev, i, spec, angles, rim, topEnd, useArcLength, useSuperellipse)
+        canReuseCubicSeamFromPrev(
+          prev,
+          i,
+          spec,
+          angles,
+          rim,
+          topEnd,
+          useArcLength,
+          useSuperellipse,
+        )
       ) {
         seamControls.push(prev.seamControls[i]!);
       } else {
@@ -1385,7 +1594,7 @@ export function buildSkeleton(
     spec.semiAxisX,
     spec.semiAxisY,
     spec.yawRad,
-    { ...spec.visor, halfSpanRad: visorHalf }
+    { ...spec.visor, halfSpanRad: visorHalf },
   );
 
   return {
