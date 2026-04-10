@@ -315,24 +315,36 @@ export const VISOR_TUCK_HEIGHT_M = 0.006;
 
 const FILLET_SEGMENTS = 5;
 
-function pushTriangle(
+type VisorUV = [number, number];
+
+function pushTriangleUv(
   positions: number[],
+  uv: number[],
   a: [number, number, number],
   b: [number, number, number],
   c: [number, number, number],
+  ua: VisorUV,
+  ub: VisorUV,
+  uc: VisorUV,
 ): void {
   positions.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]);
+  uv.push(ua[0], ua[1], ub[0], ub[1], uc[0], uc[1]);
 }
 
-function pushQuad(
+function pushQuadUv(
   positions: number[],
+  uv: number[],
   a: [number, number, number],
   b: [number, number, number],
   c: [number, number, number],
   d: [number, number, number],
+  ua: VisorUV,
+  ub: VisorUV,
+  uc: VisorUV,
+  ud: VisorUV,
 ): void {
-  pushTriangle(positions, a, b, c);
-  pushTriangle(positions, a, c, d);
+  pushTriangleUv(positions, uv, a, b, c, ua, ub, uc);
+  pushTriangleUv(positions, uv, a, c, d, ua, uc, ud);
 }
 
 /** Inward XY direction from point toward centroid (visor interior). */
@@ -516,12 +528,21 @@ export function buildVisorGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
     "position",
   ) as THREE.BufferAttribute | null;
   const allPositions: number[] = [];
+  const allUvs: number[] = [];
   if (botAttr)
     for (let i = 0; i < botAttr.count * 3; i++)
       allPositions.push(botAttr.array[i]!);
+  const botUv = bottom.getAttribute("uv") as THREE.BufferAttribute | null;
+  if (botUv) {
+    for (let i = 0; i < botUv.count * 2; i++) allUvs.push(botUv.array[i]!);
+  }
   if (topAttr)
     for (let i = 0; i < topAttr.count * 3; i++)
       allPositions.push(topAttr.array[i]!);
+  const topUv = top.getAttribute("uv") as THREE.BufferAttribute | null;
+  if (topUv) {
+    for (let i = 0; i < topUv.count * 2; i++) allUvs.push(topUv.array[i]!);
+  }
   top.dispose();
   bottom.dispose();
   if (allPositions.length > 0) {
@@ -529,6 +550,9 @@ export function buildVisorGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
       "position",
       new THREE.Float32BufferAttribute(allPositions, 3),
     );
+    if (allUvs.length === (allPositions.length / 3) * 2) {
+      merged.setAttribute("uv", new THREE.Float32BufferAttribute(allUvs, 2));
+    }
     merged.computeVertexNormals();
   }
   return merged;
@@ -588,27 +612,59 @@ export function buildVisorTopBottomGeometries(
   const zTopWall = t - R;
 
   const topPos: number[] = [];
+  const topUv: number[] = [];
   const botPos: number[] = [];
+  const botUv: number[] = [];
 
   // Bottom mesh: flat underside only (meets hat at rim inset; outer edge inset).
   for (let i = 0; i < m - 1; i++) {
-    pushTriangle(botPos, rimBotFlat[i]!, outerBotFlat[i]!, rimBotFlat[i + 1]!);
-    pushTriangle(
+    const s0 = i / (m - 1);
+    const s1 = (i + 1) / (m - 1);
+    pushTriangleUv(
       botPos,
+      botUv,
+      rimBotFlat[i]!,
+      outerBotFlat[i]!,
+      rimBotFlat[i + 1]!,
+      [s0, 0],
+      [s0, 1],
+      [s1, 0],
+    );
+    pushTriangleUv(
+      botPos,
+      botUv,
       rimBotFlat[i + 1]!,
       outerBotFlat[i]!,
       outerBotFlat[i + 1]!,
+      [s1, 0],
+      [s0, 1],
+      [s1, 1],
     );
   }
 
   // Top mesh: top face + entire perimeter (all fillets and walls); one material to the edge.
   for (let i = 0; i < m - 1; i++) {
-    pushTriangle(topPos, rimTopFlat[i]!, rimTopFlat[i + 1]!, outerTopFlat[i]!);
-    pushTriangle(
+    const s0 = i / (m - 1);
+    const s1 = (i + 1) / (m - 1);
+    pushTriangleUv(
       topPos,
+      topUv,
+      rimTopFlat[i]!,
+      rimTopFlat[i + 1]!,
+      outerTopFlat[i]!,
+      [s0, 0],
+      [s1, 0],
+      [s0, 1],
+    );
+    pushTriangleUv(
+      topPos,
+      topUv,
       rimTopFlat[i + 1]!,
       outerTopFlat[i + 1]!,
       outerTopFlat[i]!,
+      [s1, 0],
+      [s1, 1],
+      [s0, 1],
     );
   }
 
@@ -617,17 +673,28 @@ export function buildVisorTopBottomGeometries(
   if (!omitInnerRim) {
     // --- Inner rim edge (rim droop matches bill curvature; wall connects fillets) ---
     for (let i = 0; i < m - 1; i++) {
+      const s0 = i / (m - 1);
+      const s1 = (i + 1) / (m - 1);
       for (let k = 0; k < FILLET_SEGMENTS; k++) {
-        pushQuad(
+        const v0 = k / FILLET_SEGMENTS;
+        const v1 = (k + 1) / FILLET_SEGMENTS;
+        pushQuadUv(
           topPos,
+          topUv,
           rimFilletBot[i]![k]!,
           rimFilletBot[i + 1]![k]!,
           rimFilletBot[i + 1]![k + 1]!,
           rimFilletBot[i]![k + 1]!,
+          [s0, v0],
+          [s1, v0],
+          [s1, v1],
+          [s0, v1],
         );
       }
     }
     for (let i = 0; i < m - 1; i++) {
+      const s0 = i / (m - 1);
+      const s1 = (i + 1) / (m - 1);
       const d0 = rimDroop[i]!;
       const d1 = rimDroop[i + 1]!;
       const r0b: [number, number, number] = [
@@ -650,16 +717,25 @@ export function buildVisorTopBottomGeometries(
         rim[i + 1]![1],
         d1 + zTopWall,
       ];
-      pushQuad(topPos, r0b, r1b, r1t, r0t);
+      pushQuadUv(topPos, topUv, r0b, r1b, r1t, r0t, [s0, 0], [s1, 0], [s1, 1], [s0, 1]);
     }
     for (let i = 0; i < m - 1; i++) {
+      const s0 = i / (m - 1);
+      const s1 = (i + 1) / (m - 1);
       for (let k = 0; k < FILLET_SEGMENTS; k++) {
-        pushQuad(
+        const v0 = k / FILLET_SEGMENTS;
+        const v1 = (k + 1) / FILLET_SEGMENTS;
+        pushQuadUv(
           topPos,
+          topUv,
           rimFilletTop[i]![k]!,
           rimFilletTop[i + 1]![k]!,
           rimFilletTop[i + 1]![k + 1]!,
           rimFilletTop[i]![k + 1]!,
+          [s0, v0],
+          [s1, v0],
+          [s1, v1],
+          [s0, v1],
         );
       }
     }
@@ -667,17 +743,28 @@ export function buildVisorTopBottomGeometries(
 
   // --- Outer edge (z-values offset by per-sample droop) ---
   for (let i = 0; i < m - 1; i++) {
+    const s0 = i / (m - 1);
+    const s1 = (i + 1) / (m - 1);
     for (let k = 0; k < FILLET_SEGMENTS; k++) {
-      pushQuad(
+      const v0 = k / FILLET_SEGMENTS;
+      const v1 = (k + 1) / FILLET_SEGMENTS;
+      pushQuadUv(
         topPos,
+        topUv,
         outerFilletBot[i]![k]!,
         outerFilletBot[i]![k + 1]!,
         outerFilletBot[i + 1]![k + 1]!,
         outerFilletBot[i + 1]![k]!,
+        [s0, v0],
+        [s0, v1],
+        [s1, v1],
+        [s1, v0],
       );
     }
   }
   for (let i = 0; i < m - 1; i++) {
+    const s0 = i / (m - 1);
+    const s1 = (i + 1) / (m - 1);
     const d0 = droop[i]!;
     const d1 = droop[i + 1]!;
     const o0b: [number, number, number] = [
@@ -700,31 +787,48 @@ export function buildVisorTopBottomGeometries(
       outer[i + 1]![1],
       d1 + zTopWall,
     ];
-    pushQuad(topPos, o0b, o1b, o1t, o0t);
+    pushQuadUv(topPos, topUv, o0b, o1b, o1t, o0t, [s0, 0], [s1, 0], [s1, 1], [s0, 1]);
   }
   for (let i = 0; i < m - 1; i++) {
+    const s0 = i / (m - 1);
+    const s1 = (i + 1) / (m - 1);
     for (let k = 0; k < FILLET_SEGMENTS; k++) {
-      pushQuad(
+      const v0 = k / FILLET_SEGMENTS;
+      const v1 = (k + 1) / FILLET_SEGMENTS;
+      pushQuadUv(
         topPos,
+        topUv,
         outerFilletTop[i]![k]!,
         outerFilletTop[i]![k + 1]!,
         outerFilletTop[i + 1]![k + 1]!,
         outerFilletTop[i + 1]![k]!,
+        [s0, v0],
+        [s0, v1],
+        [s1, v1],
+        [s1, v0],
       );
     }
   }
 
   // --- End caps (left & right tips of visor; droop[0]=droop[m-1]=0) ---
   for (const side of [0, m - 1] as const) {
+    const sTip = side / (m - 1);
     const ds = droop[side]!;
     const dr = rimDroop[side]!;
     for (let k = 0; k < FILLET_SEGMENTS; k++) {
-      pushQuad(
+      const v0 = k / FILLET_SEGMENTS;
+      const v1 = (k + 1) / FILLET_SEGMENTS;
+      pushQuadUv(
         topPos,
+        topUv,
         rimFilletBot[side]![k]!,
         outerFilletBot[side]![k]!,
         outerFilletBot[side]![k + 1]!,
         rimFilletBot[side]![k + 1]!,
+        [v0, 0],
+        [v0, 1],
+        [v1, 1],
+        [v1, 0],
       );
     }
     const rb: [number, number, number] = [
@@ -747,14 +851,21 @@ export function buildVisorTopBottomGeometries(
       outer[side]![1],
       ds + zTopWall,
     ];
-    pushQuad(topPos, rb, ob, ot, rt);
+    pushQuadUv(topPos, topUv, rb, ob, ot, rt, [sTip, 0], [sTip, 1], [sTip, 1], [sTip, 0]);
     for (let k = 0; k < FILLET_SEGMENTS; k++) {
-      pushQuad(
+      const v0 = k / FILLET_SEGMENTS;
+      const v1 = (k + 1) / FILLET_SEGMENTS;
+      pushQuadUv(
         topPos,
+        topUv,
         rimFilletTop[side]![k]!,
         outerFilletTop[side]![k]!,
         outerFilletTop[side]![k + 1]!,
         rimFilletTop[side]![k + 1]!,
+        [v0, 0],
+        [v0, 1],
+        [v1, 1],
+        [v1, 0],
       );
     }
   }
@@ -773,10 +884,12 @@ export function buildVisorTopBottomGeometries(
 
   const topGeo = new THREE.BufferGeometry();
   topGeo.setAttribute("position", new THREE.Float32BufferAttribute(topPos, 3));
+  topGeo.setAttribute("uv", new THREE.Float32BufferAttribute(topUv, 2));
   topGeo.computeVertexNormals();
 
   const botGeo = new THREE.BufferGeometry();
   botGeo.setAttribute("position", new THREE.Float32BufferAttribute(botPos, 3));
+  botGeo.setAttribute("uv", new THREE.Float32BufferAttribute(botUv, 2));
   botGeo.computeVertexNormals();
 
   return { top: topGeo, bottom: botGeo };
@@ -929,18 +1042,26 @@ export function buildVisorFilletGeometry(
   if (outerCols.length < 2) return new THREE.BufferGeometry();
 
   const positions: number[] = [];
+  const uvs: number[] = [];
   const n = FILLET_ARC_STEPS + 1;
   const mc = outerCols.length;
+  const uI = (i: number) => i / Math.max(1, mc - 1);
+  const vS = (s: number) => s / Math.max(1, n - 1);
 
   // Outer skin
   for (let i = 0; i < mc - 1; i++) {
     for (let s = 0; s < n - 1; s++) {
-      pushQuad(
+      pushQuadUv(
         positions,
+        uvs,
         outerCols[i]![s]!,
         outerCols[i + 1]![s]!,
         outerCols[i + 1]![s + 1]!,
         outerCols[i]![s + 1]!,
+        [uI(i), vS(s)],
+        [uI(i + 1), vS(s)],
+        [uI(i + 1), vS(s + 1)],
+        [uI(i), vS(s + 1)],
       );
     }
   }
@@ -948,35 +1069,50 @@ export function buildVisorFilletGeometry(
   // Inner skin (reversed winding for inward-facing normals)
   for (let i = 0; i < mc - 1; i++) {
     for (let s = 0; s < n - 1; s++) {
-      pushQuad(
+      pushQuadUv(
         positions,
+        uvs,
         innerCols[i]![s]!,
         innerCols[i]![s + 1]!,
         innerCols[i + 1]![s + 1]!,
         innerCols[i + 1]![s]!,
+        [uI(i), vS(s)],
+        [uI(i), vS(s + 1)],
+        [uI(i + 1), vS(s + 1)],
+        [uI(i + 1), vS(s)],
       );
     }
   }
 
   // Bottom cap (s = 0 edge, seals visor side)
   for (let i = 0; i < mc - 1; i++) {
-    pushQuad(
+    pushQuadUv(
       positions,
+      uvs,
       outerCols[i]![0]!,
       innerCols[i]![0]!,
       innerCols[i + 1]![0]!,
       outerCols[i + 1]![0]!,
+      [uI(i), 0],
+      [uI(i), 1],
+      [uI(i + 1), 1],
+      [uI(i + 1), 0],
     );
   }
 
   // Top cap (s = n−1 edge, seals crown side)
   for (let i = 0; i < mc - 1; i++) {
-    pushQuad(
+    pushQuadUv(
       positions,
+      uvs,
       outerCols[i]![n - 1]!,
       outerCols[i + 1]![n - 1]!,
       innerCols[i + 1]![n - 1]!,
       innerCols[i]![n - 1]!,
+      [uI(i), 0],
+      [uI(i + 1), 0],
+      [uI(i + 1), 1],
+      [uI(i), 1],
     );
   }
 
@@ -988,6 +1124,7 @@ export function buildVisorFilletGeometry(
       "position",
       new THREE.Float32BufferAttribute(positions, 3),
     );
+    geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
     geo.computeVertexNormals();
   }
   return geo;
@@ -1053,16 +1190,26 @@ export function buildVisorTuckGeometry(
   }
 
   const positions: number[] = [];
+  const uvs: number[] = [];
   const ringCount = cols[0]!.length;
 
   for (let i = 0; i < m - 1; i++) {
+    const u0 = i / (m - 1);
+    const u1 = (i + 1) / (m - 1);
     for (let r = 0; r < ringCount - 1; r++) {
-      pushQuad(
+      const v0 = r / Math.max(1, ringCount - 1);
+      const v1 = (r + 1) / Math.max(1, ringCount - 1);
+      pushQuadUv(
         positions,
+        uvs,
         cols[i]![r]!,
         cols[i + 1]![r]!,
         cols[i + 1]![r + 1]!,
         cols[i]![r + 1]!,
+        [u0, v0],
+        [u1, v0],
+        [u1, v1],
+        [u0, v1],
       );
     }
   }
@@ -1073,6 +1220,7 @@ export function buildVisorTuckGeometry(
       "position",
       new THREE.Float32BufferAttribute(positions, 3),
     );
+    geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
     geo.computeVertexNormals();
   }
   return geo;

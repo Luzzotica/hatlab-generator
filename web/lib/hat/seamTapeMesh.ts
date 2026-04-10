@@ -34,6 +34,12 @@ import {
 /** Visible tape width (ribbon cross-section). */
 export const SEAM_TAPE_WIDTH_M = 0.014;
 
+/**
+ * Upper end of seam parameter `t` (rim → top) for tape, threading, and other crown decorations.
+ * Slightly below 1.0 avoids Z-fighting with the top button ring while reaching the button visually.
+ */
+export const SEAM_DECORATION_U_MAX = 0.995;
+
 const SEAM_TAPE_HALF_WIDTH_M = SEAM_TAPE_WIDTH_M * 0.5;
 
 /** Offset along the outward surface normal (clears the shell into the interior). */
@@ -45,17 +51,8 @@ const SEAM_TAPE_RADIAL_OFFSET_M = 0.0005;
 /** Extra pull at the rim (sweatband) anchor: inward in XY toward the crown axis (0 = no skew vs seam). */
 const SEAM_TAPE_ANCHOR_BASE_INWARD_M = 0;
 
-/** Move the crown end of the tape slightly down along the seam (toward the rim). */
-const SEAM_TAPE_ANCHOR_TOP_ALONG_SEAM_M = 0.0005;
-
-/** Rear seam tape only: run closer to the button (user asked not to shorten this further). */
-const SEAM_TAPE_U_MAX_REAR = 0.97;
-
-/** Front center seam tape: same vertical span as the rear strip. */
-const SEAM_TAPE_U_MAX_FRONT = 0.97;
-
-/** Cross / diameter tapes: same vertical span as the rear strip. */
-const SEAM_TAPE_U_MAX_CROSS = 0.97;
+/** Move the crown end of the tape slightly down along the seam (toward the rim). 0 = extend to {@link SEAM_DECORATION_U_MAX} without extra pullback. */
+const SEAM_TAPE_ANCHOR_TOP_ALONG_SEAM_M = 0;
 
 const SEAM_CURVE_SEGMENTS = 40;
 
@@ -317,7 +314,7 @@ function seamWireframeOffset(
     seamIdx,
     segments,
     uMin,
-    SEAM_TAPE_U_MAX_CROSS,
+    SEAM_DECORATION_U_MAX,
   );
   applySeamTapeAnchorsOpenStrip(pts);
   return pts;
@@ -346,14 +343,14 @@ function joinOppositeSeamDiameter(
     a,
     segments,
     uMinA,
-    SEAM_TAPE_U_MAX_CROSS,
+    SEAM_DECORATION_U_MAX,
   );
   const stripB = seamWireframePointsRaw(
     sk,
     b,
     segments,
     uMinB,
-    SEAM_TAPE_U_MAX_CROSS,
+    SEAM_DECORATION_U_MAX,
   );
   if (stripA.length < 2 || stripB.length < 2) return stripA;
   const apexA = stripA[stripA.length - 1]!;
@@ -415,7 +412,7 @@ export function buildSeamTapeGroup(sk: BuiltSkeleton): THREE.Group {
     sk.seamControls[rearIdx]!,
     SEAM_CURVE_SEGMENTS,
     rearUMin,
-    SEAM_TAPE_U_MAX_REAR,
+    SEAM_DECORATION_U_MAX,
   ).map((p) => offsetSeamTapeAlongSurface(p, sk.spec));
   applySeamTapeAnchorsOpenStrip(rearRaw);
 
@@ -459,7 +456,7 @@ export function buildSeamTapeGroup(sk: BuiltSkeleton): THREE.Group {
       frontCurve,
       SEAM_CURVE_SEGMENTS,
       uMinFront,
-      SEAM_TAPE_U_MAX_FRONT,
+      SEAM_DECORATION_U_MAX,
     ).map((p) => offsetSeamTapeAlongSurface(p, sk.spec));
     applySeamTapeAnchorsOpenStrip(frontRaw);
     const frontGeo = ribbonGeometryOpen(

@@ -3,6 +3,7 @@ import {
   buildSkeleton,
   effectiveVisorHalfSpanRad,
   frontCenterSeamIndex,
+  frontRisePanelIndices,
   frontGuideAlpha,
   frontGuideArcAndVIndices,
   sampleSeamWireframe,
@@ -19,11 +20,19 @@ import {
   crownVerticalRings,
   ruledSurfaceVertexBetweenSeams,
 } from "@/lib/mesh/crownMesh";
-import { getClosureCutterOutline } from "@/lib/mesh/backClosureSubtract";
+import {
+  BACK_CLOSURE_WIDTH_M,
+  BACK_CLOSURE_TAPE_MARGIN_M,
+  getBackClosureOpeningFrame,
+  getClosureCutterOutline,
+  getRearClosureAdjacentPanelIndices,
+} from "@/lib/mesh/backClosureSubtract";
 import {
   buildSweatbandGeometry,
+  type BackClosureTuckLiftParams,
   type VisorTuckLiftParams,
 } from "@/lib/mesh/sweatbandMesh";
+import { rimWorldXYToSweatbandTheta } from "@/lib/mesh/sweatbandMesh";
 import {
   buildVisorGeometry,
   buildVisorTopBottomGeometries,
@@ -39,7 +48,10 @@ import type { VisorThreadingGeometries } from "@/lib/hat/visorThreadProjection";
 import { buildThreadingGroup } from "@/lib/hat/threadingMesh";
 import { buildBillRopeGroup } from "@/lib/hat/billRopeMesh";
 import { buildEyeletGroup } from "@/lib/hat/eyeletMesh";
-import { agentDebugLog } from "@/lib/debug/agentDebugLog";
+import { buildClosureGroup } from "@/lib/hat/buildClosureGroup";
+import { neutralizeExportMaterialTree } from "@/lib/export/hatExportTextures";
+import { buildHatVariantSpec } from "@/lib/export/buildHatVariantSpec";
+import type { HatDocument, VisorShapeIndex } from "@/lib/hat/hatDocument";
 
 const SEAM_SEGMENTS = 40;
 
@@ -278,6 +290,41 @@ function buildTopButtonMesh(sk: BuiltSkeleton): THREE.Mesh {
   return mesh;
 }
 
+/**
+ * Inward tuck peaked at each closure rail (half the visor slab thickness); sweatband applies a
+ * vertical-edge profile so rim and top stay on the crown column.
+ */
+function backClosureTuckLiftParams(
+  sk: BuiltSkeleton,
+): BackClosureTuckLiftParams | undefined {
+  if (!sk.spec.backClosureOpening || sk.spec.closures.length === 0) return undefined;
+  const { tW, rimAnchor } = getBackClosureOpeningFrame(sk);
+  const halfW = (BACK_CLOSURE_WIDTH_M + BACK_CLOSURE_TAPE_MARGIN_M) * 0.5 + 0.01;
+  const leftPt: [number, number, number] = [
+    rimAnchor[0] - halfW * tW[0],
+    rimAnchor[1] - halfW * tW[1],
+    rimAnchor[2] - halfW * tW[2],
+  ];
+  const rightPt: [number, number, number] = [
+    rimAnchor[0] + halfW * tW[0],
+    rimAnchor[1] + halfW * tW[1],
+    rimAnchor[2] + halfW * tW[2],
+  ];
+  const spec = sk.spec;
+  const thetaL = rimWorldXYToSweatbandTheta(spec, leftPt[0], leftPt[1]);
+  const thetaR = rimWorldXYToSweatbandTheta(spec, rightPt[0], rightPt[1]);
+  const rail: Omit<VisorTuckLiftParams, "thetaCenter"> = {
+    halfSpanRad: 0.34,
+    liftAmount: VISOR_THICKNESS_M,
+    liftHeightM: VISOR_TUCK_HEIGHT_M,
+    blendAngleRad: 0.12,
+  };
+  return {
+    left: { thetaCenter: thetaL, ...rail },
+    right: { thetaCenter: thetaR, ...rail },
+  };
+}
+
 function visorTuckLiftParams(
   sk: BuiltSkeleton,
 ): VisorTuckLiftParams | undefined {
@@ -298,16 +345,21 @@ function visorTuckLiftParams(
 }
 
 /** Inner front rise liner (split from crown shells); drawn before sweatband and seam tape. */
-function buildInnerFrontRiseGroup(sk: BuiltSkeleton): THREE.Group {
-  const mat = new THREE.MeshStandardMaterial({
-    color: 0x00f0ff,
-    emissive: 0x003844,
-    emissiveIntensity: 0.35,
-    flatShading: false,
-    side: THREE.DoubleSide,
-    metalness: 0.06,
-    roughness: 0.55,
-  });
+function buildInnerFrontRiseGroup(
+  sk: BuiltSkeleton,
+  matOverride?: THREE.MeshStandardMaterial,
+): THREE.Group {
+  const mat =
+    matOverride ??
+    new THREE.MeshStandardMaterial({
+      color: 0x00f0ff,
+      emissive: 0x003844,
+      emissiveIntensity: 0.35,
+      flatShading: false,
+      side: THREE.DoubleSide,
+      metalness: 0.06,
+      roughness: 0.55,
+    });
   const geos = buildInnerFrontRiseGeometries(sk);
   const group = new THREE.Group();
   group.name = "InnerFrontRise";
@@ -321,15 +373,6 @@ function buildInnerFrontRiseGroup(sk: BuiltSkeleton): THREE.Group {
 
 /** Full hat: crown mesh + optional debug guides when `SHOW_HAT_DEBUG_LINES` is true. */
 export function buildHatGroup(sk: BuiltSkeleton): THREE.Group {
-  // #region agent log
-  agentDebugLog({
-    hypothesisId: "P0",
-    location: "buildHatGroup:entry",
-    message: "buildHatGroup start",
-    data: { backClosureOpening: sk.spec.backClosureOpening === true, nSeams: sk.spec.nSeams },
-    runId: "closure-crash",
-  });
-  // #endregion
   const root = new THREE.Group();
   root.name = "Hat";
   // Skeleton is built in +Z up (+Y forward). Rotate −90° about X so the hat sits Y-up in Three.js
@@ -343,43 +386,7 @@ export function buildHatGroup(sk: BuiltSkeleton): THREE.Group {
     metalness: 0.1,
     roughness: 0.85,
   });
-  let panelGeos: THREE.BufferGeometry[];
-  try {
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "P1",
-      location: "buildHatGroup:beforeCrown",
-      message: "before buildCrownPanelGeometries",
-      runId: "closure-crash",
-    });
-    // #endregion
-    panelGeos = buildCrownPanelGeometries(sk);
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "P1",
-      location: "buildHatGroup:afterCrown",
-      message: "after buildCrownPanelGeometries",
-      data: { panelCount: panelGeos.length },
-      runId: "closure-crash",
-    });
-    // #endregion
-  } catch (e) {
-    const err = e instanceof Error ? e : new Error(String(e));
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "P1",
-      location: "buildHatGroup:crownCatch",
-      message: "buildCrownPanelGeometries threw",
-      data: {
-        name: err.name,
-        message: err.message,
-        stack: err.stack?.slice(0, 4000) ?? "",
-      },
-      runId: "closure-crash",
-    });
-    // #endregion
-    throw e;
-  }
+  const panelGeos = buildCrownPanelGeometries(sk);
   const crownGroup = new THREE.Group();
   crownGroup.name = "Crown";
   panelGeos.forEach((geo, i) => {
@@ -452,41 +459,11 @@ export function buildHatGroup(sk: BuiltSkeleton): THREE.Group {
   }
 
   const liftParams = visorTuckLiftParams(sk);
-  let sweatbandGeo: THREE.BufferGeometry;
-  try {
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "P2",
-      location: "buildHatGroup:beforeSweatband",
-      message: "before buildSweatbandGeometry",
-      runId: "closure-crash",
-    });
-    // #endregion
-    sweatbandGeo = buildSweatbandGeometry(sk, {
-      closure: sk.spec.backClosureOpening === true,
-      lift: liftParams,
-    });
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "P2",
-      location: "buildHatGroup:afterSweatband",
-      message: "after buildSweatbandGeometry",
-      runId: "closure-crash",
-    });
-    // #endregion
-  } catch (e) {
-    const err = e instanceof Error ? e : new Error(String(e));
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "P2",
-      location: "buildHatGroup:sweatbandCatch",
-      message: "buildSweatbandGeometry threw",
-      data: { name: err.name, message: err.message, stack: err.stack?.slice(0, 4000) ?? "" },
-      runId: "closure-crash",
-    });
-    // #endregion
-    throw e;
-  }
+  const sweatbandGeo = buildSweatbandGeometry(sk, {
+    closure: sk.spec.backClosureOpening === true,
+    lift: liftParams,
+    backClosureTuck: backClosureTuckLiftParams(sk),
+  });
   const sweatband = new THREE.Mesh(
     sweatbandGeo,
     new THREE.MeshStandardMaterial({
@@ -509,73 +486,13 @@ export function buildHatGroup(sk: BuiltSkeleton): THREE.Group {
     visorSlabGeometries = { top, bottom };
   }
 
-  let seamTape: THREE.Group;
-  try {
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "P3",
-      location: "buildHatGroup:beforeSeamTape",
-      message: "before buildSeamTapeGroup",
-      runId: "closure-crash",
-    });
-    // #endregion
-    seamTape = buildSeamTapeGroup(sk);
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "P3",
-      location: "buildHatGroup:afterSeamTape",
-      message: "after buildSeamTapeGroup",
-      runId: "closure-crash",
-    });
-    // #endregion
-  } catch (e) {
-    const err = e instanceof Error ? e : new Error(String(e));
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "P3",
-      location: "buildHatGroup:seamTapeCatch",
-      message: "buildSeamTapeGroup threw",
-      data: { name: err.name, message: err.message, stack: err.stack?.slice(0, 4000) ?? "" },
-      runId: "closure-crash",
-    });
-    // #endregion
-    throw e;
-  }
+  const seamTape = buildSeamTapeGroup(sk);
   root.add(seamTape);
 
-  let threading: THREE.Group;
-  try {
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "P4",
-      location: "buildHatGroup:beforeThreading",
-      message: "before buildThreadingGroup",
-      runId: "closure-crash",
-    });
-    // #endregion
-    threading = buildThreadingGroup(sk, visorSlabGeometries);
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "P4",
-      location: "buildHatGroup:afterThreading",
-      message: "after buildThreadingGroup",
-      runId: "closure-crash",
-    });
-    // #endregion
-  } catch (e) {
-    const err = e instanceof Error ? e : new Error(String(e));
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "P4",
-      location: "buildHatGroup:threadingCatch",
-      message: "buildThreadingGroup threw",
-      data: { name: err.name, message: err.message, stack: err.stack?.slice(0, 4000) ?? "" },
-      runId: "closure-crash",
-    });
-    // #endregion
-    throw e;
-  }
+  const threading = buildThreadingGroup(sk, visorSlabGeometries);
   root.add(threading);
+
+  root.add(buildClosureGroup(sk));
 
   if (SHOW_HAT_DEBUG_LINES) {
     const rimPts = sweatbandPolyline(sk.spec, 96);
@@ -787,22 +704,31 @@ export function buildHatGroupFromSpec(spec: HatSkeletonSpec): THREE.Group {
   return buildHatGroup(buildSkeleton(spec));
 }
 
+/** Pitch −90° about local X: skeleton +Z-up → Three.js Y-up (rim in XZ). Applied on the *child* of the export yaw node. */
+export const HAT_EXPORT_GROUP_ROOT_ROTATION_X = -Math.PI / 2;
+/** Yaw π about world +Y (vertical through the hat) so exported forward matches common DCC / engines. Kept on the *parent* of the pitch node so pitch+yaw are not stored on one Euler (gimbal lock at −90° pitch breaks GLB orientation). */
+export const HAT_EXPORT_GROUP_ROOT_ROTATION_Y = Math.PI;
+
 /**
  * Export-only group: physical hat parts only (no debug lines or guide wireframes).
- * Hierarchy: Hat → Crown (Panel_0…N), Eyelets (optional), InnerFrontRise, TopButton, Sweatband, SeamTape (…), Threading, Visor (Bottom, Fillet, Tuck, Top), BillRope.
+ * Hierarchy: Hat (yaw) → HatExportFrame (pitch) → Crown (Panel_0…N), Eyelets (optional), InnerFrontRise, TopButton, Sweatband, SeamTape (…), Threading, Closures (optional), Visor (Bottom, Fillet, Tuck, Top), BillRope.
  */
 export function buildHatExportGroup(spec: HatSkeletonSpec): THREE.Group {
   const sk = buildSkeleton(spec);
   const root = new THREE.Group();
   root.name = "Hat";
-  root.rotation.x = -Math.PI / 2;
+  root.rotation.y = HAT_EXPORT_GROUP_ROOT_ROTATION_Y;
+  const frame = new THREE.Group();
+  frame.name = "HatExportFrame";
+  frame.rotation.x = HAT_EXPORT_GROUP_ROOT_ROTATION_X;
+  root.add(frame);
 
   const crownMat = new THREE.MeshStandardMaterial({
-    color: 0x6b7280,
+    color: 0xffffff,
     flatShading: false,
     side: THREE.DoubleSide,
-    metalness: 0.1,
-    roughness: 0.85,
+    metalness: 0,
+    roughness: 1,
   });
   const panelGeos = buildCrownPanelGeometries(sk);
   const crownGroup = new THREE.Group();
@@ -812,30 +738,29 @@ export function buildHatExportGroup(spec: HatSkeletonSpec): THREE.Group {
     mesh.name = `Panel_${i}`;
     crownGroup.add(mesh);
   });
-  root.add(crownGroup);
+  frame.add(crownGroup);
   if (sk.spec.eyeletStyle !== "none") {
-    root.add(buildEyeletGroup(sk, panelGeos));
+    frame.add(buildEyeletGroup(sk, panelGeos));
   }
-  root.add(buildInnerFrontRiseGroup(sk));
-  root.add(buildTopButtonMesh(sk));
+  frame.add(buildInnerFrontRiseGroup(sk, crownMat));
+  frame.add(buildTopButtonMesh(sk));
 
   const exportLiftParams = visorTuckLiftParams(sk);
   const sweatbandGeo = buildSweatbandGeometry(sk, {
     closure: sk.spec.backClosureOpening === true,
     lift: exportLiftParams,
+    backClosureTuck: backClosureTuckLiftParams(sk),
   });
-  const sweatband = new THREE.Mesh(
-    sweatbandGeo,
-    new THREE.MeshStandardMaterial({
-      color: 0xff00ff,
-      flatShading: false,
-      side: THREE.DoubleSide,
-      metalness: 0.05,
-      roughness: 0.92,
-    }),
-  );
+  const sweatbandMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    flatShading: false,
+    side: THREE.DoubleSide,
+    metalness: 0,
+    roughness: 1,
+  });
+  const sweatband = new THREE.Mesh(sweatbandGeo, sweatbandMat);
   sweatband.name = "Sweatband";
-  root.add(sweatband);
+  frame.add(sweatband);
 
   let exportVisorSlabGeometries: VisorThreadingGeometries | undefined;
   if (sk.visorPolyline.length >= 2) {
@@ -845,25 +770,26 @@ export function buildHatExportGroup(spec: HatSkeletonSpec): THREE.Group {
     exportVisorSlabGeometries = { top, bottom };
   }
 
-  root.add(buildSeamTapeGroup(sk));
-  root.add(buildThreadingGroup(sk, exportVisorSlabGeometries));
+  frame.add(buildSeamTapeGroup(sk));
+  frame.add(buildThreadingGroup(sk, exportVisorSlabGeometries));
+  frame.add(buildClosureGroup(sk));
 
   if (sk.visorPolyline.length >= 2) {
     const visorMat = new THREE.MeshStandardMaterial({
-      color: 0x52525b,
+      color: 0xffffff,
       flatShading: false,
       side: THREE.DoubleSide,
-      metalness: 0.08,
-      roughness: 0.88,
+      metalness: 0,
+      roughness: 1,
     });
     const visorBotMat = new THREE.MeshStandardMaterial({
-      color: 0x00ffd5,
-      emissive: 0x00aa99,
-      emissiveIntensity: 0.45,
+      color: 0xffffff,
+      emissive: 0x000000,
+      emissiveIntensity: 0,
       flatShading: false,
       side: THREE.DoubleSide,
-      metalness: 0.06,
-      roughness: 0.55,
+      metalness: 0,
+      roughness: 1,
     });
     const { top: visorTopGeo, bottom: visorBotGeo } = exportVisorSlabGeometries!;
     const visorGroup = new THREE.Group();
@@ -884,9 +810,232 @@ export function buildHatExportGroup(spec: HatSkeletonSpec): THREE.Group {
     const visorTop = new THREE.Mesh(visorTopGeo, visorMat);
     visorTop.name = "Visor_Top";
     visorGroup.add(visorTop);
-    root.add(visorGroup);
-    root.add(buildBillRopeGroup(sk));
+    frame.add(visorGroup);
+    frame.add(buildBillRopeGroup(sk));
   }
 
+  neutralizeExportMaterialTree(root);
+  return root;
+}
+
+/**
+ * Full-hat GLB export: crown in `Crown_Front` / `Crown_Side` / `Crown_Rear` (rear under slots) +
+ * two slot groups. `Fitted` holds rear crown (closed), sweatband, seam tape, and threading for
+ * no-opening mode; `Closure` holds the same four plus snapback hardware. Toggle `Fitted.visible` /
+ * `Closure.visible` to swap modes. Also: inner rise, top button, eyelets, visor. Export pose:
+ * parent yaw + child pitch (see {@link buildHatExportGroup}).
+ */
+export function buildHatExportGroupModular(
+  doc: HatDocument,
+  visorIndex: VisorShapeIndex,
+): THREE.Group {
+  const specFitted = buildHatVariantSpec(doc, visorIndex, {
+    eyeletStyle: "none",
+    closureClosedBack: true,
+  });
+  const specClosureSurface = buildHatVariantSpec(doc, visorIndex, {
+    eyeletStyle: "none",
+    closureClosedBack: false,
+    includeClosureHardware: false,
+  });
+  const specClosureHw = buildHatVariantSpec(doc, visorIndex, {
+    eyeletStyle: "none",
+    closureClosedBack: false,
+  });
+
+  const skF = buildSkeleton(specFitted);
+  const skC = buildSkeleton(specClosureSurface);
+  const skCHw = buildSkeleton(specClosureHw);
+
+  const n = skF.spec.nSeams;
+  const { leftPanel, rightPanel } = getRearClosureAdjacentPanelIndices(n);
+
+  const panelGeosF = buildCrownPanelGeometries(skF);
+  const panelGeosC = buildCrownPanelGeometries(skC);
+
+  const root = new THREE.Group();
+  root.name = "HatExportModular";
+  root.rotation.y = HAT_EXPORT_GROUP_ROOT_ROTATION_Y;
+  const frame = new THREE.Group();
+  frame.name = "HatExportFrame";
+  frame.rotation.x = HAT_EXPORT_GROUP_ROOT_ROTATION_X;
+  root.add(frame);
+
+  const crownMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    flatShading: false,
+    side: THREE.DoubleSide,
+    metalness: 0,
+    roughness: 1,
+  });
+
+  const frontPanelSet = new Set(frontRisePanelIndices(n));
+  const rearPanelSet = new Set([leftPanel, rightPanel]);
+
+  const crownFront = new THREE.Group();
+  crownFront.name = "Crown_Front";
+  const crownSide = new THREE.Group();
+  crownSide.name = "Crown_Side";
+  for (let i = 0; i < n; i++) {
+    if (rearPanelSet.has(i)) continue;
+    const mesh = new THREE.Mesh(panelGeosF[i]!, crownMat);
+    mesh.name = `Panel_${i}`;
+    if (frontPanelSet.has(i)) crownFront.add(mesh);
+    else crownSide.add(mesh);
+  }
+  frame.add(crownFront);
+  frame.add(crownSide);
+
+  const fitted = new THREE.Group();
+  fitted.name = "Fitted";
+
+  const crownRearFitted = new THREE.Group();
+  crownRearFitted.name = "Crown_Rear";
+  for (const pi of [leftPanel, rightPanel]) {
+    const mesh = new THREE.Mesh(panelGeosF[pi]!, crownMat);
+    mesh.name = `Panel_${pi}`;
+    crownRearFitted.add(mesh);
+  }
+  fitted.add(crownRearFitted);
+
+  const exportLiftParams = visorTuckLiftParams(skF);
+  const sweatbandMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    flatShading: false,
+    side: THREE.DoubleSide,
+    metalness: 0,
+    roughness: 1,
+  });
+
+  const sweatbandFitted = new THREE.Mesh(
+    buildSweatbandGeometry(skF, {
+      closure: false,
+      lift: exportLiftParams,
+      backClosureTuck: undefined,
+    }),
+    sweatbandMat,
+  );
+  sweatbandFitted.name = "Sweatband";
+  fitted.add(sweatbandFitted);
+
+  let exportVisorSlabGeometries: VisorThreadingGeometries | undefined;
+  if (skF.visorPolyline.length >= 2) {
+    const { top, bottom } = buildVisorTopBottomGeometries(skF, {
+      omitInnerRimInTop: true,
+    });
+    exportVisorSlabGeometries = { top, bottom };
+  }
+
+  const seamTapeFitted = buildSeamTapeGroup(skF);
+  seamTapeFitted.name = "SeamTape";
+  fitted.add(seamTapeFitted);
+
+  const threadingFitted = buildThreadingGroup(skF, exportVisorSlabGeometries);
+  threadingFitted.name = "Threading";
+  fitted.add(threadingFitted);
+
+  frame.add(fitted);
+
+  const closure = new THREE.Group();
+  closure.name = "Closure";
+
+  const crownRearClosure = new THREE.Group();
+  crownRearClosure.name = "Crown_Rear";
+  for (const pi of [leftPanel, rightPanel]) {
+    const mesh = new THREE.Mesh(panelGeosC[pi]!, crownMat);
+    mesh.name = `Panel_${pi}`;
+    crownRearClosure.add(mesh);
+  }
+  closure.add(crownRearClosure);
+
+  const sweatbandClosure = new THREE.Mesh(
+    buildSweatbandGeometry(skC, {
+      closure: true,
+      lift: exportLiftParams,
+      backClosureTuck: backClosureTuckLiftParams(skC),
+    }),
+    sweatbandMat,
+  );
+  sweatbandClosure.name = "Sweatband";
+  closure.add(sweatbandClosure);
+
+  const seamTapeClosure = buildSeamTapeGroup(skC);
+  seamTapeClosure.name = "SeamTape";
+  closure.add(seamTapeClosure);
+
+  const threadingClosure = buildThreadingGroup(skC, exportVisorSlabGeometries);
+  threadingClosure.name = "Threading";
+  closure.add(threadingClosure);
+
+  const hardware = buildClosureGroup(skCHw);
+  hardware.name = "Hardware";
+  closure.add(hardware);
+
+  frame.add(closure);
+
+  frame.add(buildInnerFrontRiseGroup(skF, crownMat));
+  frame.add(buildTopButtonMesh(skF));
+
+  const specCloth = buildHatVariantSpec(doc, visorIndex, {
+    eyeletStyle: "cloth",
+    closureClosedBack: true,
+  });
+  const skCloth = buildSkeleton(specCloth);
+  const pgCloth = buildCrownPanelGeometries(skCloth);
+  const eyeletsCloth = buildEyeletGroup(skCloth, pgCloth);
+  eyeletsCloth.name = "Eyelets_Cloth";
+  frame.add(eyeletsCloth);
+
+  const specMetal = buildHatVariantSpec(doc, visorIndex, {
+    eyeletStyle: "metal",
+    closureClosedBack: true,
+  });
+  const skMetal = buildSkeleton(specMetal);
+  const pgMetal = buildCrownPanelGeometries(skMetal);
+  const eyeletsMetal = buildEyeletGroup(skMetal, pgMetal);
+  eyeletsMetal.name = "Eyelets_Metal";
+  frame.add(eyeletsMetal);
+
+  if (skF.visorPolyline.length >= 2) {
+    const visorMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      flatShading: false,
+      side: THREE.DoubleSide,
+      metalness: 0,
+      roughness: 1,
+    });
+    const visorBotMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      emissive: 0x000000,
+      emissiveIntensity: 0,
+      flatShading: false,
+      side: THREE.DoubleSide,
+      metalness: 0,
+      roughness: 1,
+    });
+    const { top: visorTopGeo, bottom: visorBotGeo } = exportVisorSlabGeometries!;
+    const visorGroup = new THREE.Group();
+    visorGroup.name = "Visor";
+    const visorBot = new THREE.Mesh(visorBotGeo, visorBotMat);
+    visorBot.name = "Visor_Bottom";
+    visorGroup.add(visorBot);
+    const filletGeo = buildVisorFilletGeometry(skF);
+    const fillet = new THREE.Mesh(filletGeo, visorBotMat);
+    fillet.name = "Visor_Fillet";
+    fillet.renderOrder = 2;
+    visorGroup.add(fillet);
+    const tuckGeo = buildVisorTuckGeometry(skF);
+    const tuck = new THREE.Mesh(tuckGeo, visorBotMat);
+    tuck.name = "Visor_Tuck";
+    tuck.renderOrder = 1;
+    visorGroup.add(tuck);
+    const visorTop = new THREE.Mesh(visorTopGeo, visorMat);
+    visorTop.name = "Visor_Top";
+    visorGroup.add(visorTop);
+    frame.add(visorGroup);
+    frame.add(buildBillRopeGroup(skF));
+  }
+
+  neutralizeExportMaterialTree(root);
   return root;
 }

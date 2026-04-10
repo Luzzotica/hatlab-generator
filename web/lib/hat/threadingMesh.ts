@@ -2,12 +2,14 @@ import * as THREE from "three";
 import {
   effectiveVisorHalfSpanRad,
   frontCenterSeamIndex,
+  frontRisePanelIndices,
   rearCenterSeamIndex,
   sampleVisorSuperellipsePolyline,
   sweatbandPoint,
+  visorFrontBellAtTheta,
   type BuiltSkeleton,
 } from "@/lib/skeleton/geometry";
-import type { HatSkeletonSpec } from "@/lib/skeleton/types";
+import type { HatSkeletonSpec, PanelCount } from "@/lib/skeleton/types";
 import {
   BACK_CLOSURE_STRAIGHT_EDGE_M,
   BACK_CLOSURE_TAPE_MARGIN_M,
@@ -71,6 +73,14 @@ const THREAD_GAP_M = 0.0015;
  * without making stitches visibly float off the surface. */
 const THREAD_CROWN_OFFSET_M = 0.0006;
 
+/**
+ * Extra outward offset (m) only on the two front-panel **edge** seam rows (left seam → L row,
+ * right seam → R row) when the visor lifts the rim — reduces z-fight with the visor shell.
+ * Scaled by {@link visorFrontBellAtTheta} and strongest near the rim.
+ */
+/** Extra clearance on front edge seam L/R rows when visor lifts the rim (see applyFrontEdgeVisorThreadClearance). */
+const THREAD_FRONT_EDGE_VISOR_CLEAR_M = 0.005;
+
 /** Lateral offset from seam centerline for left/right stitch rows. */
 const THREAD_SEAM_LATERAL_M = 0.002;
 
@@ -79,6 +89,17 @@ const THREAD_SEAM_U_MAX = 0.97;
 
 /** Number of segments when sampling seam curves for threading. */
 const THREAD_SEAM_SEGMENTS = 60;
+
+/**
+ * Rear snapback opening: stadium used to split seam threading so it does not stitch through the hole.
+ * Midway between seam-tape size and the tighter size (half the previous extension toward the opening).
+ */
+const REAR_CLOSURE_THREAD_STADIUM_W_M =
+  BACK_CLOSURE_WIDTH_M +
+  BACK_CLOSURE_TAPE_MARGIN_M +
+  0.5 * SEAM_TAPE_WIDTH_M;
+const REAR_CLOSURE_THREAD_STADIUM_S_M =
+  BACK_CLOSURE_STRAIGHT_EDGE_M + BACK_CLOSURE_TAPE_MARGIN_M * 0.5;
 
 /**
  * Offset visor stitch centerlines from the slab along the ruled surface normal (m).
@@ -205,6 +226,48 @@ function seamPointsOutward(
 }
 
 /**
+ * Left/right seam indices bounding the visor-facing front panels (6-panel: 0 and 2; 5-panel: 0 and 1).
+ */
+function frontPanelEdgeSeamIndices(nSeams: number): { left: number; right: number } {
+  const fp = frontRisePanelIndices(nSeams as PanelCount);
+  const leftSeam = fp[0]!;
+  const lastFrontPanel = fp[fp.length - 1]!;
+  const rightSeam = (lastFrontPanel + 1) % nSeams;
+  return { left: leftSeam, right: rightSeam };
+}
+
+/**
+ * Push a seam ribbon polyline slightly further outward when the front rim is lifted toward the visor.
+ * Only intended for {@link frontPanelEdgeSeamIndices} L/R rows.
+ */
+function applyFrontEdgeVisorThreadClearance(
+  sk: BuiltSkeleton,
+  points: Vec3[],
+  seamIdx: number,
+): Vec3[] {
+  const curv = sk.spec.visor.visorCurvatureM ?? 0;
+  if (curv <= 1e-15 || points.length < 2) return points;
+  const bell = visorFrontBellAtTheta(sk, sk.angles[seamIdx]!);
+  if (bell <= 1e-15) return points;
+  const n = points.length;
+  const denom = Math.max(1, n - 1);
+  const gain = Math.min(curv / 0.03, 1.5);
+  return points.map((p, i) => {
+    const s = i / denom;
+    const u = s * THREAD_SEAM_U_MAX;
+    const rimFade = (1 - u / THREAD_SEAM_U_MAX) ** 2;
+    const extra =
+      THREAD_FRONT_EDGE_VISOR_CLEAR_M * bell * rimFade * gain;
+    const nrm = outwardCrownNormalApprox(p, sk.spec);
+    return [
+      p[0] + nrm[0] * extra,
+      p[1] + nrm[1] * extra,
+      p[2] + nrm[2] * extra,
+    ];
+  });
+}
+
+/**
  * Offset a polyline laterally on the crown surface.
  * First computes a consistent unit lateral direction at every point
  * (tangent x surface normal, with sign continuity), then shifts each
@@ -291,6 +354,7 @@ function buildSeamThreading(
   const nFn = crownNormalFn(sk.spec);
   const frontIdx = frontCenterSeamIndex(nSeams);
   const fivePanelPartial = sk.spec.fivePanelCenterSeamLength < 1;
+  const edgeSeams = frontPanelEdgeSeamIndices(nSeams);
 
   for (let i = 0; i < nSeams; i++) {
     let centerline = seamPointsOutward(
@@ -316,16 +380,13 @@ function buildSeamThreading(
       const rearIdx = rearCenterSeamIndex(nSeams);
       if (i === rearIdx) {
         const frame = getBackClosureOpeningFrame(sk);
-        const clipW =
-          BACK_CLOSURE_WIDTH_M + BACK_CLOSURE_TAPE_MARGIN_M + SEAM_TAPE_WIDTH_M;
-        const clipS = BACK_CLOSURE_STRAIGHT_EDGE_M + BACK_CLOSURE_TAPE_MARGIN_M;
         segments = segmentPolylineExcludingStadium(
           centerline,
           frame.rimAnchor,
           frame.tW,
           frame.tH,
-          clipW,
-          clipS,
+          REAR_CLOSURE_THREAD_STADIUM_W_M,
+          REAR_CLOSURE_THREAD_STADIUM_S_M,
         );
       }
     }
@@ -333,7 +394,10 @@ function buildSeamThreading(
     const skipRight = fivePanelPartial && i === frontIdx;
 
     for (const seg of segments) {
-      const left = offsetPolylineLateral(seg, sk.spec, THREAD_SEAM_LATERAL_M);
+      let left = offsetPolylineLateral(seg, sk.spec, THREAD_SEAM_LATERAL_M);
+      if (i === edgeSeams.left) {
+        left = applyFrontEdgeVisorThreadClearance(sk, left, i);
+      }
 
       const geoL = dashedRibbonGeometry(
         left,
@@ -349,11 +413,14 @@ function buildSeamThreading(
       }
 
       if (!skipRight) {
-        const right = offsetPolylineLateral(
+        let right = offsetPolylineLateral(
           seg,
           sk.spec,
           -THREAD_SEAM_LATERAL_M,
         );
+        if (i === edgeSeams.right) {
+          right = applyFrontEdgeVisorThreadClearance(sk, right, i);
+        }
         const geoR = dashedRibbonGeometry(
           right,
           THREAD_HALF_WIDTH_M,

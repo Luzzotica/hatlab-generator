@@ -978,7 +978,7 @@ export function sampleSeamWireframeRange(
   return pts;
 }
 
-/** Same as {@link sampleSeamWireframe} but only samples `t ∈ [0, tMax]` (e.g. stop below the button ring). */
+/** Same as {@link sampleSeamWireframe} but only samples `t ∈ [0, tMax]` (rim → top; use tMax near 1 for decorations that meet the button). */
 export function sampleSeamWireframeTo(
   curve: SeamCurve,
   segments: number,

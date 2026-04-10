@@ -23,8 +23,9 @@ export const BACK_CLOSURE_TOTAL_HEIGHT_M =
 /**
  * Move the opening toward the brim along −tH (from seam rim toward band). The seam sample at u=0
  * can sit slightly above where the sweatband polyline reads visually on screen.
+ * {@link getBackClosureOpeningFrame}'s `rimAnchor` is `pRim − tH * this` (lh = 0 at rimAnchor; seam rim is at lh = +this).
  */
-const BACK_CLOSURE_DROP_TOWARD_BRIM_M = 0.02;
+export const BACK_CLOSURE_DROP_TOWARD_BRIM_M = 0.02;
 
 /** Extra width + straight leg on arch tape relative to cutout (pattern margin). */
 export const BACK_CLOSURE_TAPE_MARGIN_M = 0.01;

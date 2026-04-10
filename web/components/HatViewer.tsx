@@ -6,6 +6,7 @@ import {
   useCallback,
   useDeferredValue,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -14,13 +15,16 @@ import { Canvas } from "@react-three/fiber";
 import { OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import { HatModel } from "./HatModel";
 import {
+  DEFAULT_VISOR_THREADING_SCALE,
   defaultHatSkeletonSpec,
   mergeHatSpecDefaults,
   type FrontSeamMode,
   type HatMeasurementTargets,
   type EyeletStyle,
+  type HatClosureSpec,
   type HatSkeletonSpec,
   type SeamEndpointStyle,
+  type VisorSpec,
   validateSpec,
 } from "@/lib/skeleton/types";
 import {
@@ -34,6 +38,29 @@ import { resolveSeamEndpointStyleForIndex } from "@/lib/skeleton/geometry";
 import { buildHatExportGroup } from "@/lib/hat/buildHatGroup";
 import type { MeasurementFieldHighlight } from "@/lib/hat/measurementHighlight";
 import { exportObjectToGLB, downloadBlob } from "@/lib/export/gltf";
+import { computeTangentsForExport } from "@/lib/export/prepareExportGeometry";
+import {
+  createDefaultHatDocument,
+  effectiveMeasurementTargets as mergeEffectiveMeasurementTargets,
+  finalizeSpecForVisorShape,
+  parseHatDocumentJSON,
+  type HatDocument,
+  readHatlabStore,
+  serializeHatDocument,
+  type VisorMeasurementOverride,
+  type VisorShapeIndex,
+  VISOR_SHAPE_LABELS,
+  writeHatlabStore,
+} from "@/lib/hat/hatDocument";
+import { downloadTextFile } from "@/lib/export/downloadText";
+import { buildFullHatExportRoot } from "@/lib/export/unifiedHatExport";
+import { resolveExportModelPrefix } from "@/lib/export/hatExportNaming";
+import { disposeExportObject3D } from "@/lib/export/disposeExportObject3D";
+import {
+  buildAllHatsZipBlob,
+  exportAllHatsToPickedDirectory,
+  isFolderExportSupported,
+} from "@/lib/export/bulkHatGlbExport";
 
 type SeamGroupKey = "front" | "sideFront" | "sideBack" | "rear";
 
@@ -58,31 +85,50 @@ function patchGroupEndpointStyle(
 function Panel({
   spec,
   onChange,
-  onDownload,
-  exporting,
   measurementTargets,
-  onMeasurementTargetsChange,
+  onMeasurementBaseChange,
+  onVisorShapeMeasurementOverride,
+  onVisorOverrideChange,
+  activeVisorShape,
+  onActiveVisorShapeChange,
   measurementHighlight,
   onMeasurementHighlightChange,
 }: {
   spec: HatSkeletonSpec;
   onChange: (s: HatSkeletonSpec) => void;
-  onDownload: () => void;
-  exporting: boolean;
   measurementTargets: HatMeasurementTargets;
-  onMeasurementTargetsChange: (t: HatMeasurementTargets) => void;
+  onMeasurementBaseChange: (patch: Partial<HatMeasurementTargets>) => void;
+  onVisorShapeMeasurementOverride: (patch: VisorMeasurementOverride) => void;
+  onVisorOverrideChange: (patch: Partial<VisorSpec>) => void;
+  activeVisorShape: VisorShapeIndex;
+  onActiveVisorShapeChange: (shape: VisorShapeIndex) => void;
   measurementHighlight: MeasurementFieldHighlight;
   onMeasurementHighlightChange: (h: MeasurementFieldHighlight | null) => void;
 }) {
   const v = spec.visor;
   const set = (patch: Partial<HatSkeletonSpec>) =>
     onChange({ ...spec, ...patch });
-  const setVisor = (patch: Partial<typeof v>) =>
-    onChange({ ...spec, visor: { ...v, ...patch } });
+  const setVisor = (patch: Partial<typeof v>) => onVisorOverrideChange(patch);
 
   const mt = measurementTargets;
-  const setMt = (patch: Partial<HatMeasurementTargets>) =>
-    onMeasurementTargetsChange({ ...mt, ...patch });
+  const setMt = (patch: Partial<HatMeasurementTargets>) => {
+    const visor: Partial<VisorMeasurementOverride> = {};
+    const base: Partial<HatMeasurementTargets> = { ...patch };
+    if ("visorLengthM" in patch) {
+      visor.visorLengthM = patch.visorLengthM;
+      delete (base as { visorLengthM?: number }).visorLengthM;
+    }
+    if ("visorWidthM" in patch) {
+      visor.visorWidthM = patch.visorWidthM;
+      delete (base as { visorWidthM?: number }).visorWidthM;
+    }
+    if (Object.keys(visor).length > 0) {
+      onVisorShapeMeasurementOverride(visor);
+    }
+    if (Object.keys(base).length > 0) {
+      onMeasurementBaseChange(base);
+    }
+  };
 
   const measurementBlockRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -242,42 +288,42 @@ function Panel({
               );
             })()}
           </label>
-          <label style={lab}>
-            Visor shape
-            <select
-              value={v.visorCurvatureM ?? 0}
-              onChange={(e) =>
-                setVisor({ visorCurvatureM: Number(e.target.value) })
-              }
+          <div style={lab}>
+            <span>Visor curve (per tab)</span>
+            <div
               style={{
-                padding: "4px 6px",
-                borderRadius: 4,
-                border: "1px solid #374151",
-                background: "#1f2937",
-                color: "#e5e7eb",
-                fontSize: 12,
+                display: "flex",
+                flexWrap: "wrap",
+                gap: 6,
+                marginTop: 4,
               }}
             >
-              <option value={0}>Flat</option>
-              <option value={0.015}>1.5 cm curve</option>
-              <option value={0.02}>2 cm curve</option>
-              <option value={0.03}>3 cm curve</option>
-            </select>
-          </label>
-          <label style={lab}>
-            Front crown lift (with curve)
-            <input
-              type="range"
-              min={0}
-              max={1.5}
-              step={0.05}
-              value={v.visorFrontLiftRatio ?? 1}
-              onChange={(e) =>
-                setVisor({ visorFrontLiftRatio: Number(e.target.value) })
-              }
-            />
-            <span>{(v.visorFrontLiftRatio ?? 1).toFixed(2)}</span>
-          </label>
+              {VISOR_SHAPE_LABELS.map((label, i) => {
+                const idx = i as VisorShapeIndex;
+                const active = activeVisorShape === idx;
+                return (
+                  <button
+                    key={label}
+                    type="button"
+                    onClick={() => onActiveVisorShapeChange(idx)}
+                    style={{
+                      padding: "6px 8px",
+                      borderRadius: 6,
+                      border: active
+                        ? "1px solid #3b82f6"
+                        : "1px solid #374151",
+                      background: active ? "#1e3a5f" : "#1f2937",
+                      color: "#e5e7eb",
+                      cursor: "pointer",
+                      fontSize: 11,
+                    }}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
           <label style={lab}>
             Projection
             <input
@@ -297,12 +343,14 @@ function Panel({
               min={0.25}
               max={4}
               step={0.025}
-              value={v.visorThreadingScale ?? 1}
+              value={v.visorThreadingScale ?? DEFAULT_VISOR_THREADING_SCALE}
               onChange={(e) =>
                 setVisor({ visorThreadingScale: Number(e.target.value) })
               }
             />
-            <span>{(v.visorThreadingScale ?? 1).toFixed(3)}</span>
+            <span>
+              {(v.visorThreadingScale ?? DEFAULT_VISOR_THREADING_SCALE).toFixed(3)}
+            </span>
           </label>
           <label style={lab}>
             Half-span (max, rad)
@@ -785,16 +833,56 @@ function Panel({
           paddingTop: 10,
         }}
       >
-        <label
-          style={{ ...lab, flexDirection: "row", alignItems: "center", gap: 8 }}
-        >
-          <input
-            type="checkbox"
-            checked={spec.backClosureOpening}
-            onChange={(e) => set({ backClosureOpening: e.target.checked })}
-          />
-          <span>Back closure opening</span>
-        </label>
+        <div style={{ ...lab, marginTop: 0 }}>
+          <span style={{ fontWeight: 600 }}>Back closure</span>
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <button
+              type="button"
+              onClick={() =>
+                set({ backClosureOpening: false, closures: [] })
+              }
+              style={{
+                flex: 1,
+                padding: "8px 10px",
+                borderRadius: 6,
+                border:
+                  !spec.backClosureOpening
+                    ? "1px solid #3b82f6"
+                    : "1px solid #374151",
+                background: !spec.backClosureOpening ? "#1e3a5f" : "#1f2937",
+                color: "#e5e7eb",
+                cursor: "pointer",
+                fontSize: 12,
+              }}
+            >
+              None
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                set({
+                  backClosureOpening: true,
+                  closures: [{ type: "snapback" } satisfies HatClosureSpec],
+                })
+              }
+              style={{
+                flex: 1,
+                padding: "8px 10px",
+                borderRadius: 6,
+                border:
+                  spec.backClosureOpening
+                    ? "1px solid #3b82f6"
+                    : "1px solid #374151",
+                background: spec.backClosureOpening ? "#1e3a5f" : "#1f2937",
+                color: "#e5e7eb",
+                cursor: "pointer",
+                fontSize: 12,
+              }}
+            >
+              Snapback
+            </button>
+          </div>
+        </div>
         <div style={{ ...lab, marginTop: 8 }}>
           <span style={{ fontWeight: 600 }}>Eyelets</span>
           <div style={{ display: "flex", gap: 8 }}>
@@ -831,7 +919,7 @@ function Panel({
             <input
               type="range"
               min={0.02}
-              max={0.09}
+              max={0.12}
               step={0.001}
               value={spec.eyeletDropFromTopM}
               onChange={(e) =>
@@ -842,23 +930,6 @@ function Panel({
           </label>
         )}
       </div>
-      <button
-        type="button"
-        onClick={onDownload}
-        disabled={exporting}
-        style={{
-          marginTop: 12,
-          padding: "8px 14px",
-          borderRadius: 6,
-          border: "none",
-          background: "#3b82f6",
-          color: "#fff",
-          cursor: exporting ? "wait" : "pointer",
-          width: "100%",
-        }}
-      >
-        {exporting ? "Exporting…" : "Download GLB"}
-      </button>
     </div>
   );
 }
@@ -872,82 +943,466 @@ const lab: CSSProperties = {
 };
 
 const MEASUREMENT_SOLVE_DEBOUNCE_MS = 120;
+const PERSIST_DEBOUNCE_MS = 320;
 
 export function HatViewer() {
-  const [spec, setSpecRaw] = useState<HatSkeletonSpec>(() =>
-    mergeHatSpecDefaults(defaultHatSkeletonSpec()),
+  const storeRef = useRef<ReturnType<typeof readHatlabStore> | null>(null);
+  if (storeRef.current === null) {
+    storeRef.current = readHatlabStore();
+  }
+  const [hats, setHats] = useState<HatDocument[]>(
+    () => storeRef.current!.hats,
   );
-  const setSpec = useCallback((s: HatSkeletonSpec) => {
-    setSpecRaw(mergeHatSpecDefaults(s));
-  }, []);
+  const [activeHatId, setActiveHatId] = useState<string>(
+    () => storeRef.current!.activeHatId,
+  );
+
   const measurementSolveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
   const lastSolvedMeasurementTargetsRef = useRef<HatMeasurementTargets | null>(
     measurementTargetsFromSpec(mergeHatSpecDefaults(defaultHatSkeletonSpec())),
   );
-  const [measurementTargets, setMeasurementTargetsRaw] =
-    useState<HatMeasurementTargets>(() =>
-      measurementTargetsFromSpec(
-        mergeHatSpecDefaults(defaultHatSkeletonSpec()),
+  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const prevActiveHatIdRef = useRef<string | null>(null);
+  const importFileRef = useRef<HTMLInputElement | null>(null);
+  const importModeRef = useRef<"replace" | "new">("replace");
+
+  const activeHat = useMemo(() => {
+    const h = hats.find((x) => x.id === activeHatId);
+    return h ?? hats[0]!;
+  }, [hats, activeHatId]);
+
+  const effectiveMeasurementTargets = useMemo(
+    () =>
+      mergeEffectiveMeasurementTargets(
+        activeHat.measurementBase,
+        activeHat.activeVisorShape,
+        activeHat.visorShapeOverrides,
       ),
-    );
-  const setMeasurementTargets = useCallback((mt: HatMeasurementTargets) => {
-    setMeasurementTargetsRaw(mt);
+    [
+      activeHat.measurementBase,
+      activeHat.activeVisorShape,
+      activeHat.visorShapeOverrides,
+    ],
+  );
+
+  useEffect(() => {
+    if (hats.some((h) => h.id === activeHatId)) return;
+    if (hats[0]) setActiveHatId(hats[0].id);
+  }, [hats, activeHatId]);
+
+  useEffect(() => {
+    if (prevActiveHatIdRef.current === activeHatId) return;
+    prevActiveHatIdRef.current = activeHatId;
+    const h = hats.find((x) => x.id === activeHatId);
+    if (h) {
+      lastSolvedMeasurementTargetsRef.current = mergeEffectiveMeasurementTargets(
+        h.measurementBase,
+        h.activeVisorShape,
+        h.visorShapeOverrides,
+      );
+    }
+  }, [activeHatId, hats]);
+
+  useEffect(() => {
+    const mt = effectiveMeasurementTargets;
     if (measurementSolveTimerRef.current) {
       clearTimeout(measurementSolveTimerRef.current);
     }
     measurementSolveTimerRef.current = setTimeout(() => {
       measurementSolveTimerRef.current = null;
-      const lastSolved = lastSolvedMeasurementTargetsRef.current;
-      lastSolvedMeasurementTargetsRef.current = mt;
-      setSpecRaw((prev) => {
-        if (shouldSkipMeasurementSolve(prev, lastSolved, mt)) {
-          return prev;
-        }
-        return mergeHatSpecDefaults(
-          solveHatSpecFromMeasurementsIncremental(prev, lastSolved, mt),
-        );
-      });
+      setHats((hs) =>
+        hs.map((h) => {
+          if (h.id !== activeHatId) return h;
+          const lastSolved = lastSolvedMeasurementTargetsRef.current;
+          lastSolvedMeasurementTargetsRef.current = mt;
+          let nextSpec = h.spec;
+          if (!shouldSkipMeasurementSolve(h.spec, lastSolved, mt)) {
+            nextSpec = mergeHatSpecDefaults(
+              solveHatSpecFromMeasurementsIncremental(h.spec, lastSolved, mt),
+            );
+          }
+          nextSpec = finalizeSpecForVisorShape(
+            nextSpec,
+            h.activeVisorShape,
+            h.visorShapeOverrides,
+          );
+          return { ...h, spec: nextSpec, updatedAt: Date.now() };
+        }),
+      );
     }, MEASUREMENT_SOLVE_DEBOUNCE_MS);
-  }, []);
-  useEffect(
-    () => () => {
+    return () => {
       if (measurementSolveTimerRef.current) {
         clearTimeout(measurementSolveTimerRef.current);
+        measurementSolveTimerRef.current = null;
       }
+    };
+  }, [effectiveMeasurementTargets, activeHatId]);
+
+  useEffect(() => {
+    if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+    persistTimerRef.current = setTimeout(() => {
+      persistTimerRef.current = null;
+      writeHatlabStore({ schemaVersion: 1, activeHatId, hats });
+    }, PERSIST_DEBOUNCE_MS);
+    return () => {
+      if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+    };
+  }, [activeHatId, hats]);
+
+  const applySpecChange = useCallback(
+    (patch: Partial<HatSkeletonSpec> | HatSkeletonSpec) => {
+      setHats((hs) =>
+        hs.map((h) => {
+          if (h.id !== activeHatId) return h;
+          const next = { ...h.spec, ...patch };
+          const merged = mergeHatSpecDefaults(next);
+          const finalized = finalizeSpecForVisorShape(
+            merged,
+            h.activeVisorShape,
+            h.visorShapeOverrides,
+          );
+          return { ...h, spec: finalized, updatedAt: Date.now() };
+        }),
+      );
     },
-    [],
+    [activeHatId],
   );
 
-  const deferredSpec = useDeferredValue(spec);
+  const patchMeasurementBase = useCallback(
+    (patch: Partial<HatMeasurementTargets>) => {
+      setHats((hs) =>
+        hs.map((h) => {
+          if (h.id !== activeHatId) return h;
+          return {
+            ...h,
+            measurementBase: { ...h.measurementBase, ...patch },
+            updatedAt: Date.now(),
+          };
+        }),
+      );
+    },
+    [activeHatId],
+  );
+
+  const patchVisorShapeMeasurementOverride = useCallback(
+    (patch: VisorMeasurementOverride) => {
+      setHats((hs) =>
+        hs.map((h) => {
+          if (h.id !== activeHatId) return h;
+          const shape = h.activeVisorShape;
+          const prevO = h.visorShapeOverrides[shape] ?? {};
+          return {
+            ...h,
+            visorShapeOverrides: {
+              ...h.visorShapeOverrides,
+              [shape]: {
+                ...prevO,
+                measurements: { ...prevO.measurements, ...patch },
+              },
+            },
+            updatedAt: Date.now(),
+          };
+        }),
+      );
+    },
+    [activeHatId],
+  );
+
+  const patchVisorOverride = useCallback(
+    (patch: Partial<VisorSpec>) => {
+      setHats((hs) =>
+        hs.map((h) => {
+          if (h.id !== activeHatId) return h;
+          const shape = h.activeVisorShape;
+          const prevO = h.visorShapeOverrides[shape] ?? {};
+          const nextOverrides = {
+            ...h.visorShapeOverrides,
+            [shape]: {
+              ...prevO,
+              visor: { ...prevO.visor, ...patch },
+            },
+          };
+          const nextSpec = finalizeSpecForVisorShape(
+            mergeHatSpecDefaults(h.spec),
+            shape,
+            nextOverrides,
+          );
+          return {
+            ...h,
+            visorShapeOverrides: nextOverrides,
+            spec: nextSpec,
+            updatedAt: Date.now(),
+          };
+        }),
+      );
+    },
+    [activeHatId],
+  );
+
+  const handleVisorShapeChange = useCallback(
+    (shape: VisorShapeIndex) => {
+      if (measurementSolveTimerRef.current) {
+        clearTimeout(measurementSolveTimerRef.current);
+        measurementSolveTimerRef.current = null;
+      }
+      setHats((hs) =>
+        hs.map((h) => {
+          if (h.id !== activeHatId) return h;
+          const mt = mergeEffectiveMeasurementTargets(
+            h.measurementBase,
+            shape,
+            h.visorShapeOverrides,
+          );
+          const lastSolved = lastSolvedMeasurementTargetsRef.current;
+          lastSolvedMeasurementTargetsRef.current = mt;
+          let nextSpec = h.spec;
+          if (!shouldSkipMeasurementSolve(h.spec, lastSolved, mt)) {
+            nextSpec = mergeHatSpecDefaults(
+              solveHatSpecFromMeasurementsIncremental(h.spec, lastSolved, mt),
+            );
+          }
+          nextSpec = finalizeSpecForVisorShape(
+            nextSpec,
+            shape,
+            h.visorShapeOverrides,
+          );
+          return {
+            ...h,
+            activeVisorShape: shape,
+            spec: nextSpec,
+            updatedAt: Date.now(),
+          };
+        }),
+      );
+    },
+    [activeHatId],
+  );
+
+  const newHat = useCallback(() => {
+    const d = createDefaultHatDocument();
+    setHats((hs) => [...hs, d]);
+    setActiveHatId(d.id);
+  }, []);
+
+  const duplicateHat = useCallback(() => {
+    const h = hats.find((x) => x.id === activeHatId);
+    if (!h) return;
+    const copy: HatDocument = {
+      ...h,
+      id: crypto.randomUUID(),
+      name: `${h.name} (copy)`,
+      updatedAt: Date.now(),
+    };
+    setHats((hs) => [...hs, copy]);
+    setActiveHatId(copy.id);
+  }, [hats, activeHatId]);
+
+  const renameHat = useCallback(() => {
+    const h = hats.find((x) => x.id === activeHatId);
+    if (!h) return;
+    const next = window.prompt("Hat name", h.name);
+    if (next === null || next.trim() === "") return;
+    const name = next.trim();
+    setHats((hs) =>
+      hs.map((x) =>
+        x.id === activeHatId ? { ...x, name, updatedAt: Date.now() } : x,
+      ),
+    );
+  }, [hats, activeHatId]);
+
+  const deleteHat = useCallback(() => {
+    if (hats.length <= 1) return;
+    const idx = hats.findIndex((x) => x.id === activeHatId);
+    const next = hats.filter((x) => x.id !== activeHatId);
+    const nextId = next[Math.max(0, idx - 1)]?.id ?? next[0]?.id;
+    setHats(next);
+    if (nextId) setActiveHatId(nextId);
+  }, [hats, activeHatId]);
+
+  const exportJson = useCallback(() => {
+    const h = hats.find((x) => x.id === activeHatId);
+    if (!h) return;
+    const safe = h.name.replace(/[^\w\-]+/g, "-").replace(/^-|-$/g, "") || "hat";
+    downloadTextFile(serializeHatDocument(h), `${safe}.json`);
+  }, [hats, activeHatId]);
+
+  const importJsonFile = useCallback(
+    (file: File, mode: "replace" | "new") => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const doc = parseHatDocumentJSON(String(reader.result));
+          validateSpec(doc.spec);
+          if (mode === "replace") {
+            setHats((hs) =>
+              hs.map((h) =>
+                h.id === activeHatId
+                  ? { ...doc, id: h.id, updatedAt: Date.now() }
+                  : h,
+              ),
+            );
+          } else {
+            const copy: HatDocument = {
+              ...doc,
+              id: crypto.randomUUID(),
+              updatedAt: Date.now(),
+            };
+            setHats((hs) => [...hs, copy]);
+            setActiveHatId(copy.id);
+          }
+        } catch {
+          window.alert("Invalid hat JSON file.");
+        }
+      };
+      reader.readAsText(file);
+    },
+    [activeHatId],
+  );
+
+  const deferredSpec = useDeferredValue(activeHat.spec);
   const [measurementHighlight, setMeasurementHighlight] =
     useState<MeasurementFieldHighlight>(null);
   const [exporting, setExporting] = useState(false);
+  const [exportingFull, setExportingFull] = useState(false);
+  const [exportingAllZip, setExportingAllZip] = useState(false);
+  const [exportingAllFolder, setExportingAllFolder] = useState(false);
+  const [folderExportSupported, setFolderExportSupported] = useState(false);
+
+  useEffect(() => {
+    setFolderExportSupported(isFolderExportSupported());
+  }, []);
+
+  const exportingAll = exportingAllZip || exportingAllFolder;
+  const anyExportBusy = exporting || exportingFull || exportingAll;
 
   const onDownload = useCallback(async () => {
     try {
-      validateSpec(spec);
+      validateSpec(activeHat.spec);
     } catch {
       return;
     }
     setExporting(true);
     try {
-      const g = buildHatExportGroup(spec);
+      const g = buildHatExportGroup(activeHat.spec);
+      computeTangentsForExport(g);
       const blob = await exportObjectToGLB(g);
       g.traverse((o) => {
         if (o instanceof THREE.Mesh) {
           o.geometry.dispose();
           const m = o.material;
-          if (Array.isArray(m)) m.forEach((x) => x.dispose());
-          else m.dispose();
+          const mats = Array.isArray(m) ? m : [m];
+          for (const mat of mats) {
+            if (mat instanceof THREE.MeshStandardMaterial) {
+              mat.map?.dispose();
+              mat.normalMap?.dispose();
+              mat.roughnessMap?.dispose();
+              mat.metalnessMap?.dispose();
+              mat.aoMap?.dispose();
+            }
+            mat.dispose();
+          }
         }
       });
       downloadBlob(blob, "hat-skeleton.glb");
     } finally {
       setExporting(false);
     }
-  }, [spec]);
+  }, [activeHat.spec]);
+
+  const onExportFullHat = useCallback(async () => {
+    try {
+      validateSpec(activeHat.spec);
+    } catch {
+      return;
+    }
+    setExportingFull(true);
+    try {
+      const root = buildFullHatExportRoot(activeHat, {
+        modelPrefix: resolveExportModelPrefix(activeHat.name),
+      });
+      const blob = await exportObjectToGLB(root);
+      disposeExportObject3D(root);
+      const safe =
+        activeHat.name.replace(/[^\w\-]+/g, "-").replace(/^-|-$/g, "") ||
+        "hat";
+      downloadBlob(blob, `${safe}-full.glb`);
+    } finally {
+      setExportingFull(false);
+    }
+  }, [activeHat]);
+
+  const onExportAllZip = useCallback(async () => {
+    if (hats.length === 0) return;
+    setExportingAllZip(true);
+    try {
+      const result = await buildAllHatsZipBlob(hats);
+      if (result.exportedCount === 0) {
+        window.alert(
+          result.errors.length > 0
+            ? "No hats could be exported (all have invalid specs)."
+            : "No saved hats to export.",
+        );
+        return;
+      }
+      downloadBlob(result.blob, `hatlab-all-hats-${Date.now()}.zip`);
+      if (result.errors.length > 0) {
+        const lines = result.errors.slice(0, 15);
+        const more =
+          result.errors.length > 15
+            ? `\n… and ${result.errors.length - 15} more`
+            : "";
+        window.alert(
+          `Skipped ${result.errors.length} hat(s) with invalid spec:\n${lines.join("\n")}${more}`,
+        );
+      }
+    } finally {
+      setExportingAllZip(false);
+    }
+  }, [hats]);
+
+  const onExportAllToFolder = useCallback(async () => {
+    if (hats.length === 0) return;
+    setExportingAllFolder(true);
+    try {
+      const result = await exportAllHatsToPickedDirectory(hats);
+      if (result.exportedCount === 0) {
+        window.alert(
+          result.errors.length > 0
+            ? "No hats could be exported (all have invalid specs)."
+            : "No saved hats to export.",
+        );
+        return;
+      }
+      if (result.errors.length > 0) {
+        const lines = result.errors.slice(0, 15);
+        const more =
+          result.errors.length > 15
+            ? `\n… and ${result.errors.length - 15} more`
+            : "";
+        window.alert(
+          `Skipped ${result.errors.length} hat(s) with invalid spec:\n${lines.join("\n")}${more}`,
+        );
+      }
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      const msg = e instanceof Error ? e.message : String(e);
+      window.alert(`Folder export failed: ${msg}`);
+    } finally {
+      setExportingAllFolder(false);
+    }
+  }, [hats]);
+
+  const btnStyle = (active?: boolean): CSSProperties => ({
+    padding: "6px 8px",
+    borderRadius: 6,
+    border: active ? "1px solid #3b82f6" : "1px solid #374151",
+    background: active ? "#1e3a5f" : "#1f2937",
+    color: "#e5e7eb",
+    cursor: "pointer",
+    fontSize: 11,
+  });
 
   return (
     <div
@@ -971,13 +1426,221 @@ export function HatViewer() {
           WebkitOverflowScrolling: "touch",
         }}
       >
+        <input
+          ref={importFileRef}
+          type="file"
+          accept="application/json,.json"
+          style={{ display: "none" }}
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            e.target.value = "";
+            if (f) importJsonFile(f, importModeRef.current);
+          }}
+        />
+        <div
+          style={{
+            boxSizing: "border-box",
+            padding: "12px 16px 0",
+            borderBottom: "1px solid #27272a",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 12,
+              fontWeight: 600,
+              marginBottom: 8,
+              color: "#e5e7eb",
+            }}
+          >
+            Saved hats
+          </div>
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              gap: 6,
+              alignItems: "center",
+              marginBottom: 8,
+            }}
+          >
+            <select
+              value={activeHatId}
+              onChange={(e) => setActiveHatId(e.target.value)}
+              style={{
+                flex: "1 1 140px",
+                minWidth: 0,
+                padding: "6px 8px",
+                borderRadius: 6,
+                border: "1px solid #374151",
+                background: "#1f2937",
+                color: "#e5e7eb",
+                fontSize: 12,
+              }}
+            >
+              {hats.map((h) => (
+                <option key={h.id} value={h.id}>
+                  {h.name}
+                </option>
+              ))}
+            </select>
+            <button type="button" onClick={newHat} style={btnStyle()}>
+              New
+            </button>
+            <button type="button" onClick={renameHat} style={btnStyle()}>
+              Rename
+            </button>
+            <button type="button" onClick={duplicateHat} style={btnStyle()}>
+              Duplicate
+            </button>
+            <button
+              type="button"
+              onClick={deleteHat}
+              disabled={hats.length <= 1}
+              style={{
+                ...btnStyle(),
+                opacity: hats.length <= 1 ? 0.45 : 1,
+                cursor: hats.length <= 1 ? "not-allowed" : "pointer",
+              }}
+            >
+              Delete
+            </button>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+            <button type="button" onClick={exportJson} style={btnStyle()}>
+              Export JSON
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                importModeRef.current = "replace";
+                importFileRef.current?.click();
+              }}
+              style={btnStyle()}
+            >
+              Import (replace)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                importModeRef.current = "new";
+                importFileRef.current?.click();
+              }}
+              style={btnStyle()}
+            >
+              Import as new
+            </button>
+          </div>
+        </div>
+        <div
+          style={{
+            boxSizing: "border-box",
+            padding: "12px 16px 14px",
+            borderBottom: "1px solid #27272a",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 12,
+              fontWeight: 600,
+              marginBottom: 8,
+              color: "#e5e7eb",
+            }}
+          >
+            Export mesh (GLB)
+          </div>
+          <button
+            type="button"
+            onClick={onDownload}
+            disabled={anyExportBusy}
+            style={{
+              padding: "8px 14px",
+              borderRadius: 6,
+              border: "none",
+              background: "#3b82f6",
+              color: "#fff",
+              cursor: anyExportBusy ? "wait" : "pointer",
+              width: "100%",
+              fontSize: 12,
+            }}
+          >
+            {exporting ? "Exporting…" : "Download GLB"}
+          </button>
+          <button
+            type="button"
+            onClick={onExportFullHat}
+            disabled={anyExportBusy}
+            style={{
+              marginTop: 8,
+              padding: "8px 14px",
+              borderRadius: 6,
+              border: "1px solid #4b5563",
+              background: "#27272a",
+              color: "#e5e7eb",
+              cursor: anyExportBusy ? "wait" : "pointer",
+              width: "100%",
+              fontSize: 12,
+            }}
+          >
+            {exportingFull
+              ? "Building full hat…"
+              : "Export full hat (GLB)"}
+          </button>
+          <button
+            type="button"
+            onClick={onExportAllZip}
+            disabled={anyExportBusy || hats.length === 0}
+            style={{
+              marginTop: 8,
+              padding: "8px 14px",
+              borderRadius: 6,
+              border: "1px solid #4b5563",
+              background: "#27272a",
+              color: "#e5e7eb",
+              cursor:
+                anyExportBusy || hats.length === 0 ? "not-allowed" : "pointer",
+              width: "100%",
+              fontSize: 12,
+              opacity: hats.length === 0 ? 0.5 : 1,
+            }}
+          >
+            {exportingAllZip ? "Building ZIP…" : "Export all hats (ZIP)"}
+          </button>
+          {folderExportSupported ? (
+            <button
+              type="button"
+              onClick={onExportAllToFolder}
+              disabled={anyExportBusy || hats.length === 0}
+              style={{
+                marginTop: 8,
+                padding: "8px 14px",
+                borderRadius: 6,
+                border: "1px solid #4b5563",
+                background: "#27272a",
+                color: "#e5e7eb",
+                cursor:
+                  anyExportBusy || hats.length === 0
+                    ? "not-allowed"
+                    : "pointer",
+                width: "100%",
+                fontSize: 12,
+                opacity: hats.length === 0 ? 0.5 : 1,
+              }}
+            >
+              {exportingAllFolder
+                ? "Writing to folder…"
+                : "Export all hats to folder…"}
+            </button>
+          ) : null}
+        </div>
         <Panel
-          spec={spec}
-          onChange={setSpec}
-          onDownload={onDownload}
-          exporting={exporting}
-          measurementTargets={measurementTargets}
-          onMeasurementTargetsChange={setMeasurementTargets}
+          spec={activeHat.spec}
+          onChange={applySpecChange}
+          measurementTargets={effectiveMeasurementTargets}
+          onMeasurementBaseChange={patchMeasurementBase}
+          onVisorShapeMeasurementOverride={patchVisorShapeMeasurementOverride}
+          onVisorOverrideChange={patchVisorOverride}
+          activeVisorShape={activeHat.activeVisorShape}
+          onActiveVisorShapeChange={handleVisorShapeChange}
           measurementHighlight={measurementHighlight}
           onMeasurementHighlightChange={setMeasurementHighlight}
         />

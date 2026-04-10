@@ -26,28 +26,46 @@ export const SWEATBAND_OUTER_INSET_M = CROWN_SHELL_THICKNESS_M;
 /** Samples around the rim (full ring) or along the front arc when closure is on. */
 export const SWEATBAND_SEGMENTS = 96;
 
+/**
+ * When the sweatband is an open strip (closure rails), extend each end slightly into the rear
+ * closure gap so the strip runs almost flush with the closure arc. Clamped so a minimum gap remains.
+ */
+export const SWEATBAND_CLOSURE_ARC_EXTEND_RAD = 0.02;
+
 const FILLET_STEPS = 4;
 /** Interior samples along k between kf and (kTop − kf), excluding those endpoints. */
 const LINEAR_RING_COUNT = 11;
 
+type UVPair = [number, number];
+
 function pushTriangle(
   positions: number[],
+  uvs: number[],
   a: [number, number, number],
   b: [number, number, number],
   c: [number, number, number],
+  ua: UVPair,
+  ub: UVPair,
+  uc: UVPair,
 ): void {
   positions.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]);
+  uvs.push(ua[0], ua[1], ub[0], ub[1], uc[0], uc[1]);
 }
 
 function pushQuad(
   positions: number[],
+  uvs: number[],
   a: [number, number, number],
   b: [number, number, number],
   c: [number, number, number],
   d: [number, number, number],
+  ua: UVPair,
+  ub: UVPair,
+  uc: UVPair,
+  ud: UVPair,
 ): void {
-  pushTriangle(positions, a, b, c);
-  pushTriangle(positions, a, c, d);
+  pushTriangle(positions, uvs, a, b, c, ua, ub, uc);
+  pushTriangle(positions, uvs, a, c, d, ua, uc, ud);
 }
 
 function sub(
@@ -118,6 +136,26 @@ export function sweatbandFrontArcStartAndSpan(
     return { start: R2, span: 2 * Math.PI - dCcw };
   }
   return { start: L, span: dCcw };
+}
+
+/**
+ * Short arc (rear gap / closure strip) between closure rails: CCW start and span.
+ * Complement of {@link sweatbandFrontArcStartAndSpan}.
+ */
+export function sweatbandRearArcStartAndSpan(
+  thetaL: number,
+  thetaR: number,
+): {
+  start: number;
+  span: number;
+} {
+  const L = normalizeAngle(thetaL);
+  const R2 = normalizeAngle(thetaR);
+  const dCcw = normalizeAngle(R2 - L);
+  if (dCcw <= Math.PI + 1e-9) {
+    return { start: L, span: dCcw };
+  }
+  return { start: R2, span: 2 * Math.PI - dCcw };
 }
 
 /** Move p toward z-axis in XY by dist (inward). Negative dist pushes outward. */
@@ -254,11 +292,55 @@ function visorLiftAlpha(theta: number, lift: VisorTuckLiftParams): number {
   return 1 - smoothstep(innerEdge, lift.halfSpanRad, dist);
 }
 
+/** Pushes the sweatband outward at the closure rail edges so it overlaps the closure tabs. */
+export interface ClosureEdgeLiftParams {
+  thetaL: number;
+  thetaR: number;
+  /** Outward push amount (m) — should match or exceed the tab plastic thickness. */
+  liftAmount: number;
+  /** Angular width of the smooth blend on each side of the rail (rad). */
+  blendRad: number;
+}
+
+function closureEdgeLiftAlpha(
+  theta: number,
+  params: ClosureEdgeLiftParams,
+): number {
+  const { thetaL, thetaR, blendRad } = params;
+  let dL = theta - thetaL;
+  while (dL > Math.PI) dL -= 2 * Math.PI;
+  while (dL < -Math.PI) dL += 2 * Math.PI;
+  let dR = theta - thetaR;
+  while (dR > Math.PI) dR -= 2 * Math.PI;
+  while (dR < -Math.PI) dR += 2 * Math.PI;
+  const aL =
+    Math.abs(dL) < blendRad ? 1 - smoothstep(0, blendRad, Math.abs(dL)) : 0;
+  const aR =
+    Math.abs(dR) < blendRad ? 1 - smoothstep(0, blendRad, Math.abs(dR)) : 0;
+  return Math.max(aL, aR);
+}
+
+/**
+ * Visor-style tuck at both back-closure rails: same inward + vertical fade as {@link VisorTuckLiftParams}.
+ * Use instead of {@link ClosureEdgeLiftParams} when you want the strip to wrap the closure like the visor.
+ */
+export type BackClosureTuckLiftParams = {
+  left: VisorTuckLiftParams;
+  right: VisorTuckLiftParams;
+};
+
 export type SweatbandGeometryOptions = {
   /** When true, mesh only the front arc between closure rails (no CSG). */
   closure?: boolean;
   /** When provided, bulge the sweatband outward in the visor tuck region. */
   lift?: VisorTuckLiftParams;
+  /** When provided, raise sweatband at closure rail θ angles so it overlaps tab edges. */
+  closureEdgeLift?: ClosureEdgeLiftParams;
+  /**
+   * When provided, tuck the sweatband inward under the snapback region (same math as visor tuck).
+   * Prefer this over {@link closureEdgeLift} for a glove-like wrap; do not pass both.
+   */
+  backClosureTuck?: BackClosureTuckLiftParams;
 };
 
 /**
@@ -302,9 +384,16 @@ export function buildSweatbandGeometry(
       thetas = Array.from({ length: nSeg }, (_, i) => (i / nSeg) * 2 * Math.PI);
       openArc = false;
     } else {
+      const rearGap = 2 * Math.PI - span;
+      const extend = Math.min(
+        SWEATBAND_CLOSURE_ARC_EXTEND_RAD,
+        Math.max(0, (rearGap - 0.02) * 0.5),
+      );
+      const spanOpen = span + 2 * extend;
+      const startOpen = normalizeAngle(start - extend);
       const denom = Math.max(nSeg - 1, 1);
       thetas = Array.from({ length: nSeg }, (_, i) =>
-        normalizeAngle(start + (i / denom) * span),
+        normalizeAngle(startOpen + (i / denom) * spanOpen),
       );
       openArc = true;
     }
@@ -356,9 +445,53 @@ export function buildSweatbandGeometry(
     }
   }
 
+  const bct = options.backClosureTuck;
+  if (bct && bct.left.liftAmount > 1e-8) {
+    const amt = bct.left.liftAmount;
+    for (let i = 0; i < nSeg; i++) {
+      const theta = thetas[i]!;
+      const alpha = Math.max(
+        visorLiftAlpha(theta, bct.left),
+        visorLiftAlpha(theta, bct.right),
+      );
+      if (alpha < 1e-8) continue;
+      // Snapback meets the strip on the vertical cut edges. Tuck is strongest mid-edge so rim (r=0) and
+      // crown end (r=ringCount-1) stay on the crown-following column; uniform tuck left corners floating.
+      const rMax = Math.max(ringCount - 1, 1);
+      for (let r = 0; r < ringCount; r++) {
+        const op = outerCols[i]![r]!;
+        const edgeGamma = Math.sin((Math.PI * r) / rMax);
+        const push = amt * alpha * edgeGamma;
+        if (push < 1e-8) continue;
+        outerCols[i]![r] = offsetInwardXY(op, push);
+        innerCols[i]![r] = offsetInwardXY(outerCols[i]![r]!, thickness);
+      }
+    }
+  }
+
+  const ceLift = options.closureEdgeLift;
+  if (ceLift && ceLift.liftAmount > 1e-8) {
+    for (let i = 0; i < nSeg; i++) {
+      const theta = thetas[i]!;
+      const alpha = closureEdgeLiftAlpha(theta, ceLift);
+      if (alpha < 1e-8) continue;
+      for (let r = 0; r < ringCount; r++) {
+        const op = outerCols[i]![r]!;
+        const push = ceLift.liftAmount * alpha;
+        outerCols[i]![r] = offsetInwardXY(op, -push);
+        innerCols[i]![r] = offsetInwardXY(outerCols[i]![r]!, thickness);
+      }
+    }
+  }
+
   const positions: number[] = [];
+  const uvs: number[] = [];
   const R = ringCount;
   const wrap = !openArc;
+
+  const uAt = (i: number) =>
+    wrap ? i / Math.max(1, nSeg) : i / Math.max(1, nSeg - 1);
+  const vAt = (r: number) => r / Math.max(1, R - 1);
 
   for (let r = 0; r < R - 1; r++) {
     const iMax = wrap ? nSeg : nSeg - 1;
@@ -372,11 +505,15 @@ export function buildSweatbandGeometry(
       const ibn = innerCols[j]![r]!;
       const it = innerCols[i]![r + 1]!;
       const itn = innerCols[j]![r + 1]!;
+      const ui = uAt(i);
+      const uj = uAt(j);
+      const vr = vAt(r);
+      const vrp = vAt(r + 1);
 
-      pushQuad(positions, ob, obn, otn, ot);
-      pushQuad(positions, ibn, ib, it, itn);
-      pushQuad(positions, ob, ib, ibn, obn);
-      pushQuad(positions, ot, otn, itn, it);
+      pushQuad(positions, uvs, ob, obn, otn, ot, [ui, vr], [uj, vr], [uj, vrp], [ui, vrp]);
+      pushQuad(positions, uvs, ibn, ib, it, itn, [uj, vr], [ui, vr], [ui, vrp], [uj, vrp]);
+      pushQuad(positions, uvs, ob, ib, ibn, obn, [ui, 0], [ui, 1], [uj, 1], [uj, 0]);
+      pushQuad(positions, uvs, ot, otn, itn, it, [ui, 0], [uj, 0], [uj, 1], [ui, 1]);
     }
   }
 
@@ -386,18 +523,21 @@ export function buildSweatbandGeometry(
       const ot0 = outerCols[0]![r + 1]!;
       const ib0 = innerCols[0]![r]!;
       const it0 = innerCols[0]![r + 1]!;
-      pushQuad(positions, ob0, ib0, it0, ot0);
+      const vr = vAt(r);
+      const vrp = vAt(r + 1);
+      pushQuad(positions, uvs, ob0, ib0, it0, ot0, [0, vr], [1, vr], [1, vrp], [0, vrp]);
       const last = nSeg - 1;
       const obL = outerCols[last]![r]!;
       const otL = outerCols[last]![r + 1]!;
       const ibL = innerCols[last]![r]!;
       const itL = innerCols[last]![r + 1]!;
-      pushQuad(positions, obL, otL, itL, ibL);
+      pushQuad(positions, uvs, obL, otL, itL, ibL, [0, vr], [0, vrp], [1, vrp], [1, vr]);
     }
   }
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
   geo.computeVertexNormals();
   return geo;
 }

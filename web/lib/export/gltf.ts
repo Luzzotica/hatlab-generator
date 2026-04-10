@@ -1,7 +1,9 @@
 import * as THREE from "three";
 import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
+import { sanitizeGeometriesForGLTFExport } from "@/lib/export/prepareExportGeometry";
 
 export async function exportObjectToGLB(object: THREE.Object3D): Promise<Blob> {
+  sanitizeGeometriesForGLTFExport(object);
   const exporter = new GLTFExporter();
   const result = await exporter.parseAsync(object, { binary: true });
   if (result instanceof ArrayBuffer) {

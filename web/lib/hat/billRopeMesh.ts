@@ -517,8 +517,22 @@ function buildTaperedTubeGeometry(
 
   const { nrm, bin } = computeTubeFrames(centers);
   const positions: number[] = [];
+  const uvs: number[] = [];
   const indices: number[] = [];
   const colors: number[] = [];
+
+  const arcLen: number[] = [0];
+  for (let i = 1; i < n; i++) {
+    const p = centers[i]!;
+    const q = centers[i - 1]!;
+    arcLen.push(
+      arcLen[i - 1]! +
+        Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]),
+    );
+  }
+  const totalArc = arcLen[arcLen.length - 1]!;
+  const uAt = (i: number) =>
+    totalArc > 1e-12 ? arcLen[i]! / totalArc : i / Math.max(1, n - 1);
 
   for (let i = 0; i < n; i++) {
     const c = centers[i]!;
@@ -531,6 +545,7 @@ function buildTaperedTubeGeometry(
       Math.max(0, partIds[i] ?? 0),
     );
     const [cr, cg, cb] = BILL_ROPE_PART_RGB[pid]!;
+    const ui = uAt(i);
     for (let j = 0; j < radialSegs; j++) {
       const ang = (j / radialSegs) * Math.PI * 2;
       const cos = Math.cos(ang);
@@ -541,6 +556,7 @@ function buildTaperedTubeGeometry(
         c[2] + ri * (cos * N[2] + sin * B[2]),
       );
       colors.push(cr, cg, cb);
+      uvs.push(ui, j / radialSegs);
     }
   }
 
@@ -557,6 +573,7 @@ function buildTaperedTubeGeometry(
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
   geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
   geo.setIndex(indices);
   geo.computeVertexNormals();

@@ -278,44 +278,29 @@ function needsFullMeasurementSolve(
 function mergeSeamArcLengthsByGroupChanges(
   prevSpec: HatSkeletonSpec,
   fullNext: (number | null)[],
-  prevTargets: HatMeasurementTargets,
-  nextTargets: HatMeasurementTargets,
+  _prevTargets: HatMeasurementTargets,
+  _nextTargets: HatMeasurementTargets,
   nSeams: PanelCount
 ): (number | null)[] {
   const prevArr = prevSpec.seamTargetArcLengthM;
   if (!prevArr || prevArr.length !== nSeams) {
     return [...fullNext];
   }
-  const g = seamGroupIndices(nSeams);
   const out: (number | null)[] = new Array(nSeams).fill(null);
-  const takeFromFull = (indices: number[], groupChanged: boolean) => {
-    for (const i of indices) {
-      out[i] = groupChanged ? fullNext[i]! : prevArr[i] ?? fullNext[i]!;
-    }
-  };
-  takeFromFull(
-    g.front,
-    mChanged(prevTargets.seamEdgeLengthFrontM, nextTargets.seamEdgeLengthFrontM)
-  );
-  takeFromFull(
-    g.sideFront,
-    mChanged(prevTargets.seamEdgeLengthSideFrontM, nextTargets.seamEdgeLengthSideFrontM)
-  );
-  takeFromFull(
-    g.sideBack,
-    mChanged(prevTargets.seamEdgeLengthSideBackM, nextTargets.seamEdgeLengthSideBackM)
-  );
-  takeFromFull(
-    g.rear,
-    mChanged(prevTargets.seamEdgeLengthRearM, nextTargets.seamEdgeLengthRearM)
-  );
+  for (let i = 0; i < nSeams; i++) {
+    // Prefer canonical lengths from nextTargets (fullNext). Using prevArr when the
+    // measurement group was "unchanged" breaks when lastSolved ref already matches next
+    // targets but prevSpec is still stale (second debounced setState / batched update):
+    // prevArr would win over fullNext and revert a seam the first pass had just fixed.
+    out[i] = fullNext[i] ?? prevArr[i] ?? null;
+  }
   return out;
 }
 
 /**
  * Apply measurement targets with minimal recomputation: only run semi-axes / visor bisection
- * when those inputs change; only overwrite `seamTargetArcLengthM` for seam groups whose
- * target length changed.
+ * when those inputs change; `seamTargetArcLengthM` is filled from current measurement
+ * targets (with null fallbacks from the previous spec when a group target is unset).
  *
  * Falls back to {@link solveHatSpecFromMeasurements} when front split mode is involved or
  * `prevTargets` is null.

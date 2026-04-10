@@ -28,11 +28,6 @@ export interface VisorSpec {
    */
   visorCurvatureM: number;
   /**
-   * Scales how much the front-rise crown panels lift (+Z) to follow the visor curve.
-   * 0 = no crown bend; 1 matches the visor curvature amplitude at the rim.
-   */
-  visorFrontLiftRatio: number;
-  /**
    * Multiplier on visor **thread** planform depth (forward `b` toward the brim). Valid range `[0.1, 4]`.
    * Tune when automatic placement vs visor length needs a manual nudge.
    */
@@ -51,6 +46,15 @@ export type CrownPanelMode = 5 | 6;
 
 /** Crown ventilation eyelets: same mesh for `cloth` and `metal`; materials differ. */
 export type EyeletStyle = "none" | "cloth" | "metal";
+
+/** Discriminator for closure hardware at the rear opening (see `backClosureOpening`). */
+export type HatClosureKind = "snapback";
+
+/**
+ * Per-kind closure options; extend with union members as new closures are added.
+ * Only built when `backClosureOpening` is true.
+ */
+export type HatClosureSpec = { type: "snapback" };
 
 /**
  * How seam curves (rim → top) are defined: quadratic bulge (`squareness`), arc-length target
@@ -200,6 +204,11 @@ export interface HatSkeletonSpec {
    */
   backClosureOpening: boolean;
   /**
+   * Enabled closure hardware at the rear opening. Only rendered when `backClosureOpening` is true.
+   * At most one entry per {@link HatClosureKind} (validated in {@link validateSpec}).
+   */
+  closures: HatClosureSpec[];
+  /**
    * Radial inward groove depth at panel seams on the outer crown (metres). The crown shell is ~2 mm
    * thick; the inner surface follows with a smooth falloff so the seam reads as rounded inward.
    * Typical ~0.0005 (0.5 mm).
@@ -215,6 +224,9 @@ export interface HatSkeletonSpec {
   visor: VisorSpec;
 }
 
+/** Default for {@link VisorSpec.visorThreadingScale} when omitted. */
+export const DEFAULT_VISOR_THREADING_SCALE = 2.75;
+
 export const defaultVisorSpec = (): VisorSpec => ({
   attachAngleRad: 0.5 * Math.PI,
   /** Large enough that the seam-based cap (below) usually applies, not this value. */
@@ -226,9 +238,8 @@ export const defaultVisorSpec = (): VisorSpec => ({
   superellipseN: 3,
   samples: 48,
   visorCurvatureM: 0,
-  visorFrontLiftRatio: 1,
-  /** Default &lt; 1 so threads fit typical brim depth; raise in the viewer if needed. */
-  visorThreadingScale: 0.9,
+  /** Multiplier on thread forward depth; tune in the viewer if needed. */
+  visorThreadingScale: DEFAULT_VISOR_THREADING_SCALE,
 });
 
 export const defaultHatSkeletonSpec = (): HatSkeletonSpec => ({
@@ -250,10 +261,11 @@ export const defaultHatSkeletonSpec = (): HatSkeletonSpec => ({
   fivePanelFrontSeams: { visor: 0.35, crown: 0.35, splitT: 0.45 },
   fivePanelCenterSeamLength: 1.0,
   crownPanelMode: 6,
-  backClosureOpening: false,
+  backClosureOpening: true,
+  closures: [{ type: "snapback" }],
   seamGrooveDepthM: 0.0005,
   eyeletStyle: "none",
-  eyeletDropFromTopM: 0.045,
+  eyeletDropFromTopM: 0.06,
   visor: defaultVisorSpec(),
 });
 
@@ -274,6 +286,13 @@ export function mergeHatSpecDefaults(spec: HatSkeletonSpec): HatSkeletonSpec {
       : spec.fivePanelCenterSeamLength < 1
         ? 5
         : 6);
+  const backClosureOpening = spec.backClosureOpening ?? d.backClosureOpening;
+  let closures = spec.closures ?? d.closures;
+  if (!backClosureOpening) {
+    closures = [];
+  } else if (closures.length === 0) {
+    closures = [{ type: "snapback" }];
+  }
   return {
     ...d,
     ...spec,
@@ -282,7 +301,8 @@ export function mergeHatSpecDefaults(spec: HatSkeletonSpec): HatSkeletonSpec {
     seamArcLengthMultiplier: spec.seamArcLengthMultiplier ?? d.seamArcLengthMultiplier,
     seamSuperellipseN: spec.seamSuperellipseN ?? d.seamSuperellipseN,
     topRimFraction,
-    backClosureOpening: spec.backClosureOpening ?? d.backClosureOpening,
+    backClosureOpening,
+    closures,
     seamEndpointStyles: spec.seamEndpointStyles ?? d.seamEndpointStyles,
     seamTargetArcLengthM: spec.seamTargetArcLengthM ?? d.seamTargetArcLengthM,
     seamGrooveDepthM: spec.seamGrooveDepthM ?? d.seamGrooveDepthM,
@@ -293,6 +313,13 @@ export function mergeHatSpecDefaults(spec: HatSkeletonSpec): HatSkeletonSpec {
 }
 
 export function validateSpec(spec: HatSkeletonSpec): void {
+  const seenClosure = new Set<string>();
+  for (const c of spec.closures) {
+    if (seenClosure.has(c.type)) {
+      throw new Error(`duplicate closure type: ${c.type}`);
+    }
+    seenClosure.add(c.type);
+  }
   if (spec.nSeams !== 5 && spec.nSeams !== 6) {
     throw new Error("nSeams must be 5 or 6");
   }
@@ -321,11 +348,7 @@ export function validateSpec(spec: HatSkeletonSpec): void {
   if (curv < 0 || curv > 0.04) {
     throw new Error("visorCurvatureM must be in [0, 0.04]");
   }
-  const liftR = spec.visor.visorFrontLiftRatio ?? 1;
-  if (liftR < 0 || liftR > 1.5) {
-    throw new Error("visorFrontLiftRatio must be in [0, 1.5]");
-  }
-  const threadScale = spec.visor.visorThreadingScale ?? 1;
+  const threadScale = spec.visor.visorThreadingScale ?? DEFAULT_VISOR_THREADING_SCALE;
   if (threadScale < 0.1 || threadScale > 4) {
     throw new Error("visorThreadingScale must be in [0.1, 4]");
   }
