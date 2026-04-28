@@ -1258,6 +1258,20 @@ export function evalSeamSuperellipse(
   return add(add(mid, scale(uVec, lx)), scale(perp, ly));
 }
 
+/**
+ * Extra planform forward depth per unit `visorCurvatureM` (1/m). The effective outward `b` in
+ * {@link sampleVisorSuperellipsePolyline} is `projection * (1 + K * visorCurvatureM)` so curved
+ * presets match the apparent stick-out of a flat bill (XY planform was identical before; curvature
+ * only added Z droop and slab lift).
+ */
+export const VISOR_CURVATURE_PLANFORM_K = 2.2;
+
+/** Outward bulge `b` for the visor superellipse (matches `projection` when curvature is 0). */
+export function visorPlanformForwardDepthM(visor: VisorSpec): number {
+  const c = visor.visorCurvatureM ?? 0;
+  return visor.projection * (1 + VISOR_CURVATURE_PLANFORM_K * c);
+}
+
 export interface SampleVisorSuperellipseOptions {
   /** Multiply half-chord length `a` (homothety in chord direction). */
   aScale: number;
@@ -1306,7 +1320,7 @@ export function sampleVisorSuperellipsePolyline(
   outward = norm(outward);
   const halfWidth = 0.5 * chordLen;
   let a = Math.max(halfWidth, 1e-6) * aScale;
-  let b = spec.projection * bScale;
+  let b = visorPlanformForwardDepthM(spec) * bScale;
   a = Math.max(a, 1e-9);
   b = Math.max(b, 0);
   const m = Math.max(2, Math.floor(mIn));

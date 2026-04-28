@@ -38,6 +38,10 @@ import {
   getVisorRuledBasis,
 } from "@/lib/mesh/visorMesh";
 import {
+  VISOR_SHAPE_CURVATURE_MS,
+  VISOR_THREAD_PLANFORM_DEPTH_SCALE_BY_SHAPE,
+} from "@/lib/hat/hatDocument";
+import {
   type VisorThreadingGeometries,
   VisorMeshRayHelper,
 } from "@/lib/hat/visorThreadProjection";
@@ -99,7 +103,12 @@ const REAR_CLOSURE_THREAD_STADIUM_W_M =
   BACK_CLOSURE_TAPE_MARGIN_M +
   0.5 * SEAM_TAPE_WIDTH_M;
 const REAR_CLOSURE_THREAD_STADIUM_S_M =
-  BACK_CLOSURE_STRAIGHT_EDGE_M + BACK_CLOSURE_TAPE_MARGIN_M * 0.5;
+  BACK_CLOSURE_STRAIGHT_EDGE_M + BACK_CLOSURE_TAPE_MARGIN_M * 0.6;
+
+/**
+ * Lowers the apex of **inner** closure arch thread only (`Thread_Arch_Inner`), along local `tH`.
+ */
+const THREAD_ARCH_INNER_PEAK_DROP_M = 0.002;
 
 /**
  * Offset visor stitch centerlines from the slab along the ruled surface normal (m).
@@ -118,7 +127,8 @@ const VISOR_THREAD_SURFACE_OFFSET_M = 0.0003;
  * Rim arc spacing between rows is **fixed** in metres
  * ({@link VISOR_THREAD_OUTER_EDGE_INSET_M}, {@link VISOR_THREAD_ROW_SPACING_RIM_M}) — independent of
  * visor projection or overall brim size. Forward depth is scaled by {@link visorThreadPlanformDepthScale}
- * so `b` tracks the **built** visor rim→outer span vs `spec.projection` (not just the spec value).
+ * and {@link VISOR_THREAD_PLANFORM_DEPTH_SCALE_BY_SHAPE} so `b` tracks the **built** visor rim→outer span
+ * vs `spec.projection` (not just the spec value) and tapers slightly per curve preset.
  * {@link VisorSpec.visorThreadingScale} multiplies forward depth for viewer tuning.
  */
 /** Homothety scale for the outermost thread row (slightly &lt; 1 to stay inside the bill edge). */
@@ -126,7 +136,7 @@ const VISOR_THREAD_HOMOTHETY_MAX = 0.97;
 /** Homothety scale for the innermost thread row (`aScale` and part of `bScale` via `k`). */
 const VISOR_THREAD_HOMOTHETY_MIN = 0.8;
 /** Number of homothetic thread rows across the visor (outer → inner). */
-const VISOR_THREAD_NUM_ROWS = 4;
+const VISOR_THREAD_NUM_ROWS = 6;
 
 /**
  * Multiplier on `spec.projection` for the superellipse **outward** (bill) axis in
@@ -150,41 +160,28 @@ const VISOR_THREAD_CHORD_S_ABS_MAX = 1;
 const VISOR_THREAD_OUTER_EDGE_INSET_M = 0.02;
 /**
  * Rim arc spacing between consecutive thread rows (m) at the advancing left tip — fixed in world
- * units so row spacing does not grow when the bill gets deeper or wider (≈1.6 cm default).
+ * units so row spacing does not grow when the bill gets deeper or wider (6 mm × 5 gaps = 30 mm span).
  */
-const VISOR_THREAD_ROW_SPACING_RIM_M = 0.01;
+const VISOR_THREAD_ROW_SPACING_RIM_M = 0.006;
 
-/** Height fractions for sweatband threading rows (bottom, middle, top). */
-const SWEATBAND_ROW_FRACTIONS = [0.08, 0.5, 0.92];
-
-const SWEATBAND_THREAD_SEGMENTS = 96;
-
-/** Base threading: vertical offset above z=0 (bill rope uses the same rim stack). */
+/** Z height used by closure hardware (velcro, snapback, etc.) to align with the hat base. */
 export const BASE_THREAD_Z_OFFSET_M = 0.003;
 
-/** Crown sweatband rim ring, same as {@link buildBaseThreading} (includes visor front lift in Z). */
+/** How far up the crown surface (in Z) the base thread ring sits above the rim. */
+const BASE_THREAD_CROWN_RISE_M = 0.003;
+
+/** Crown base thread ring: 1 mm up the crown surface from the rim, then a small normal clearance. */
 export function crownRimPointForBaseThreading(
   sk: BuiltSkeleton,
   thetaRad: number,
 ): Vec3 {
   const M = crownArcSegments(sk.spec);
   const N = crownVerticalRings(sk.spec);
-  const p = crownMeridianPointAtK(sk, thetaRad, 0, M, N);
-  return [p[0], p[1], p[2] + BASE_THREAD_Z_OFFSET_M];
+  const k = findKRingForDeltaZ(sk, thetaRad, M, N, BASE_THREAD_CROWN_RISE_M);
+  const p = crownMeridianPointAtK(sk, thetaRad, k, M, N);
+  return offsetCrownOutward(p as Vec3, sk.spec, THREAD_CROWN_OFFSET_M);
 }
 
-/**
- * Small radial inward from the sweatband outer surface (toward the hat axis) so stitches
- * sit in front of the band in the depth buffer when viewed from inside the cavity.
- */
-const THREAD_SWEATBAND_DEPTH_BIAS_INWARD_M = 0.00045;
-
-/** Half-width for sweatband thread ribbons. Larger than other threads so stitches read on the band. */
-const SWEATBAND_THREAD_HALF_WIDTH_M = 0.00135;
-
-/** Slightly longer dashes / gaps than global thread so the band pattern is easier to see. */
-const SWEATBAND_THREAD_DASH_M = 0.0028;
-const SWEATBAND_THREAD_GAP_M = 0.0018;
 
 function crownNormalFn(spec: HatSkeletonSpec) {
   return (p: Vec3) => outwardCrownNormalApprox(p, spec);
@@ -734,6 +731,27 @@ function visorThreadPlanformDepthScale(sk: BuiltSkeleton): number {
   return Math.max(0.2, Math.min(8, ratio));
 }
 
+/** Nearest visor-curve preset index for {@link VISOR_THREAD_PLANFORM_DEPTH_SCALE_BY_SHAPE}. */
+function visorCurvePresetIndexForSpec(sk: BuiltSkeleton): number {
+  const c = sk.spec.visor.visorCurvatureM ?? 0;
+  let best = 0;
+  let bestD = Infinity;
+  for (let i = 0; i < VISOR_SHAPE_CURVATURE_MS.length; i++) {
+    const d = Math.abs(VISOR_SHAPE_CURVATURE_MS[i]! - c);
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/** Small per–curve-preset multiplier so thread depth tapers slightly as curve / effective length increases. */
+function visorThreadCurvePresetDepthScale(sk: BuiltSkeleton): number {
+  const i = visorCurvePresetIndexForSpec(sk);
+  return VISOR_THREAD_PLANFORM_DEPTH_SCALE_BY_SHAPE[i] ?? 1;
+}
+
 /**
  * Half-angle span (rad) for visor threading row `row` (0 = outer): advance the left rim tip from the
  * full-visor edge by `edgeInsetM`, then by `row` steps of `rowGapM` along the rim (rim speed at each tip).
@@ -760,7 +778,8 @@ function visorThreadHalfSpanRadForRow(
 function buildVisorThreading(
   sk: BuiltSkeleton,
   mat: THREE.Material,
-  group: THREE.Group,
+  topGroup: THREE.Group,
+  botGroup: THREE.Group,
   visorGeometries?: VisorThreadingGeometries,
 ): void {
   if (sk.visorPolyline.length < 2) return;
@@ -777,7 +796,8 @@ function buildVisorThreading(
   const halfSpan = effectiveVisorHalfSpanRad(v, spec.nSeams, sk.angles);
   const edgeInsetM = VISOR_THREAD_OUTER_EDGE_INSET_M;
   const rowGapM = VISOR_THREAD_ROW_SPACING_RIM_M;
-  const planformDepthScale = visorThreadPlanformDepthScale(sk);
+  const planformDepthScale =
+    visorThreadPlanformDepthScale(sk) * visorThreadCurvePresetDepthScale(sk);
   const threadingUserScale = v.visorThreadingScale ?? 1;
 
   const projBot = visorGeometries
@@ -927,7 +947,7 @@ function buildVisorThreading(
     if (geoTop.getAttribute("position")) {
       const meshTop = new THREE.Mesh(geoTop, mat);
       meshTop.name = `Thread_Visor_Top_${row}`;
-      group.add(meshTop);
+      topGroup.add(meshTop);
     }
 
     const geoBot = dashedRibbonGeometry(
@@ -940,7 +960,7 @@ function buildVisorThreading(
     if (geoBot.getAttribute("position")) {
       const meshBot = new THREE.Mesh(geoBot, mat);
       meshBot.name = `Thread_Visor_Bot_${row}`;
-      group.add(meshBot);
+      botGroup.add(meshBot);
     }
   }
 }
@@ -987,7 +1007,12 @@ function buildArchThreading(
   for (const { frac, name } of archRows) {
     const di = dOuter * frac;
     const archHalfW = outerW * 0.5 + di;
-    const archRise = outerW * 0.5 + riseExtra * frac;
+    const archRiseBase = outerW * 0.5 + riseExtra * frac;
+    const archRise = Math.max(
+      1e-6,
+      archRiseBase -
+        (name === "Thread_Arch_Inner" ? THREAD_ARCH_INNER_PEAK_DROP_M : 0),
+    );
     const archStraight = outerS;
 
     const archPts2D = sampleOpenArchPath(archHalfW, archStraight, 56, archRise);
@@ -1016,99 +1041,6 @@ function buildArchThreading(
 }
 
 // ---------------------------------------------------------------------------
-// 5. Sweatband threading
-// ---------------------------------------------------------------------------
-
-function buildSweatbandThreading(
-  sk: BuiltSkeleton,
-  mat: THREE.Material,
-  group: THREE.Group,
-): void {
-  const spec = sk.spec;
-  const M = crownArcSegments(spec);
-  const N = crownVerticalRings(spec);
-  const inset = SWEATBAND_OUTER_INSET_M;
-  const closure = spec.backClosureOpening === true;
-
-  let thetas: number[];
-  let openArc = false;
-  const nSeg = SWEATBAND_THREAD_SEGMENTS;
-
-  if (closure) {
-    const { tW, rimAnchor } = getBackClosureOpeningFrame(sk);
-    const halfW =
-      (BACK_CLOSURE_WIDTH_M + BACK_CLOSURE_TAPE_MARGIN_M) * 0.5 + 0.01;
-    const left: Vec3 = [
-      rimAnchor[0] - halfW * tW[0],
-      rimAnchor[1] - halfW * tW[1],
-      rimAnchor[2] - halfW * tW[2],
-    ];
-    const right: Vec3 = [
-      rimAnchor[0] + halfW * tW[0],
-      rimAnchor[1] + halfW * tW[1],
-      rimAnchor[2] + halfW * tW[2],
-    ];
-    const thetaL = rimWorldXYToSweatbandTheta(spec, left[0], left[1]);
-    const thetaR = rimWorldXYToSweatbandTheta(spec, right[0], right[1]);
-    const { start, span } = sweatbandFrontArcStartAndSpan(thetaL, thetaR);
-    if (span < 0.15) {
-      thetas = Array.from({ length: nSeg }, (_, i) => (i / nSeg) * 2 * Math.PI);
-    } else {
-      thetas = Array.from(
-        { length: nSeg },
-        (_, i) => start + (i / (nSeg - 1)) * span,
-      );
-      openArc = true;
-    }
-  } else {
-    thetas = Array.from({ length: nSeg }, (_, i) => (i / nSeg) * 2 * Math.PI);
-  }
-
-  for (let row = 0; row < SWEATBAND_ROW_FRACTIONS.length; row++) {
-    const hFrac = SWEATBAND_ROW_FRACTIONS[row]!;
-    const dz = SWEATBAND_HEIGHT_M * hFrac;
-
-    const rowPoints: Vec3[] = [];
-    for (const theta of thetas) {
-      const kFloat = findKRingForDeltaZ(sk, theta, M, N, Math.max(dz, 1e-10));
-      const onOuter = outerSurfacePoint(sk, theta, kFloat, M, N, inset);
-      const p = offsetInwardXY(
-        onOuter,
-        THREAD_SWEATBAND_DEPTH_BIAS_INWARD_M,
-      ) as Vec3;
-      rowPoints.push(p);
-    }
-
-    if (!openArc && rowPoints.length > 1) {
-      rowPoints.push(rowPoints[0]!);
-    }
-
-    // Radial inward normal → cross(tangent, radialInward) = vertical direction.
-    // Ribbon width extends vertically → lies flat on the cylindrical band surface →
-    // face points radially → visible from inside the hat.
-    const radialInwardNormal = (p: Vec3): Vec3 => {
-      const L = Math.hypot(p[0], p[1]);
-      if (L < 1e-12) return [0, 0, 1];
-      return [-p[0] / L, -p[1] / L, 0];
-    };
-
-    const period = SWEATBAND_THREAD_DASH_M + SWEATBAND_THREAD_GAP_M;
-    const geo = dashedRibbonGeometry(
-      rowPoints,
-      SWEATBAND_THREAD_HALF_WIDTH_M,
-      radialInwardNormal,
-      SWEATBAND_THREAD_DASH_M,
-      SWEATBAND_THREAD_GAP_M,
-      row * (period * 0.35),
-    );
-    if (geo.getAttribute("position")) {
-      const mesh = new THREE.Mesh(geo, mat);
-      mesh.name = `Thread_Sweatband_${row}`;
-      group.add(mesh);
-    }
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -1136,11 +1068,23 @@ export function buildThreadingGroup(
     depthWrite: true,
   });
 
-  buildSeamThreading(sk, mat, group);
-  buildBaseThreading(sk, mat, group);
-  buildVisorThreading(sk, mat, group, visorGeometries);
-  buildArchThreading(sk, mat, group);
-  buildSweatbandThreading(sk, mat, group);
+  const crown = new THREE.Group();
+  crown.name = "Crown";
+
+  const upperVisor = new THREE.Group();
+  upperVisor.name = "Upper_Visor";
+
+  const underVisor = new THREE.Group();
+  underVisor.name = "Under_Visor";
+
+  buildSeamThreading(sk, mat, crown);
+  buildBaseThreading(sk, mat, crown);
+  buildVisorThreading(sk, mat, upperVisor, underVisor, visorGeometries);
+  buildArchThreading(sk, mat, crown);
+
+  group.add(crown);
+  group.add(upperVisor);
+  group.add(underVisor);
 
   return group;
 }

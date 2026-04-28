@@ -8,8 +8,8 @@ import {
   type SeamCurve,
 } from "@/lib/skeleton/geometry";
 
-/** 3 in — opening width (along circumferential / rim tangent). */
-export const BACK_CLOSURE_WIDTH_M = 3 * 0.0254;
+/** 2.6 in — opening width (along circumferential / rim tangent). */
+export const BACK_CLOSURE_WIDTH_M = 2.6 * 0.0254;
 /** Kept for reference; profile is straight sides + semicircle (see total height below). */
 export const BACK_CLOSURE_HEIGHT_M = 2.75 * 0.0254;
 
@@ -226,6 +226,50 @@ export function sampleStadiumBoundary2DClosed(
     }
   }
   return out;
+}
+
+function pointToSegmentDistance2D(
+  px: number,
+  py: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+): number {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const len2 = dx * dx + dy * dy;
+  if (len2 < 1e-18) return Math.hypot(px - x1, py - y1);
+  let t = ((px - x1) * dx + (py - y1) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  const nx = x1 + t * dx;
+  const ny = y1 + t * dy;
+  return Math.hypot(px - nx, py - ny);
+}
+
+/**
+ * Minimum distance (mm) from (lw,lh) to the stadium opening boundary when the point lies on
+ * fabric outside the cutout. Returns 0 when inside the opening (hole) or on the boundary.
+ * Used to mask laser etch away from closure arch seam tape.
+ */
+export function distanceToStadiumBoundaryOutsideMm(
+  lw: number,
+  lh: number,
+  widthM: number,
+  straightM: number,
+): number {
+  if (pointInsideStadiumOpening2D(lw, lh, widthM, straightM)) {
+    return 0;
+  }
+  const pts = sampleStadiumBoundary2DClosed(widthM, straightM, 8);
+  let minD = Infinity;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[i]!;
+    const p1 = pts[i + 1]!;
+    const d = pointToSegmentDistance2D(lw, lh, p0[0], p0[1], p1[0], p1[1]);
+    minD = Math.min(minD, d);
+  }
+  return minD * 1000;
 }
 
 /**

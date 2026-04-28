@@ -30,6 +30,7 @@ import {
   ribbonGeometryOpen,
   type Vec3,
 } from "@/lib/hat/curveUtils";
+import { VISOR_SHAPE_CURVATURE_MS } from "@/lib/hat/hatDocument";
 
 /** Visible tape width (ribbon cross-section). */
 export const SEAM_TAPE_WIDTH_M = 0.014;
@@ -105,13 +106,33 @@ function seamTapeTMinAfterRimDistanceM(
 }
 
 /**
+ * Minimum normalized seam `t` (0 = rim, 1 = button) for the front center tape to clear
+ * the sweatband when the visor is raised. Indexed by visor shape preset (flat → 3 cm rise).
+ */
+const SEAM_TAPE_FRONT_MIN_U_BY_VISOR_SHAPE: readonly number[] = [
+  0,    // flat — no extra raise needed
+  0.38, // 1.5 cm rise
+  0.41, // 2 cm rise
+  0.47, // 3 cm rise
+];
+
+/**
  * Minimum normalized seam `t` (rim = 0) so tape clears the tuck gap under a curved visor.
- * Scales with `visorCurvatureM` (~3 cm → ~0.29); 0 when flat.
+ * Looks up the closest visor shape preset from {@link VISOR_SHAPE_CURVATURE_MS}; 0 when flat.
  */
 function seamTapeExtraMinUFrontForCurvedVisor(sk: BuiltSkeleton): number {
   const c = sk.spec.visor.visorCurvatureM ?? 0;
   if (c < 1e-9) return 0;
-  return Math.min(0.42, 0.08 + c * 7);
+  let bestIdx = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < VISOR_SHAPE_CURVATURE_MS.length; i++) {
+    const dist = Math.abs(VISOR_SHAPE_CURVATURE_MS[i]! - c);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestIdx = i;
+    }
+  }
+  return SEAM_TAPE_FRONT_MIN_U_BY_VISOR_SHAPE[bestIdx] ?? 0;
 }
 
 /**

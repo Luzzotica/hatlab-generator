@@ -48,13 +48,23 @@ export type CrownPanelMode = 5 | 6;
 export type EyeletStyle = "none" | "cloth" | "metal";
 
 /** Discriminator for closure hardware at the rear opening (see `backClosureOpening`). */
-export type HatClosureKind = "snapback";
+export type HatClosureKind =
+  | "snapback"
+  | "velcro"
+  | "strapback"
+  | "metalSlide"
+  | "shockCord";
 
 /**
  * Per-kind closure options; extend with union members as new closures are added.
  * Only built when `backClosureOpening` is true.
  */
-export type HatClosureSpec = { type: "snapback" };
+export type HatClosureSpec =
+  | { type: "snapback" }
+  | { type: "velcro" }
+  | { type: "strapback" }
+  | { type: "metalSlide" }
+  | { type: "shockCord" };
 
 /**
  * How seam curves (rim → top) are defined: quadratic bulge (`squareness`), arc-length target

@@ -1,3 +1,4 @@
+import { VISOR_CURVATURE_PLANFORM_K } from "@/lib/skeleton/geometry";
 import {
   defaultHatSkeletonSpec,
   defaultVisorSpec,
@@ -7,10 +8,22 @@ import {
   type VisorSpec,
 } from "@/lib/skeleton/types";
 import { measurementTargetsFromSpec } from "@/lib/skeleton/measurements";
+import type { HatDecalPersisted } from "@/lib/decal/crownDecal";
 
 export const HATLAB_STORE_KEY = "hatlab:hats:v1";
 
 export const VISOR_SHAPE_CURVATURE_MS = [0, 0.015, 0.02, 0.03] as const;
+
+/**
+ * Multiplies visor thread forward (`b`) depth; index matches {@link VISOR_SHAPE_CURVATURE_MS}.
+ * Slightly &lt; 1 on deeper curves so stitching stays proportional as effective brim length grows.
+ */
+export const VISOR_THREAD_PLANFORM_DEPTH_SCALE_BY_SHAPE = [
+  1,
+  0.988,
+  0.976,
+  0.964,
+] as const;
 
 export type VisorShapeIndex = 0 | 1 | 2 | 3;
 
@@ -39,7 +52,11 @@ export interface HatDocument {
   measurementBase: HatMeasurementTargets;
   visorShapeOverrides: Partial<Record<VisorShapeIndex, VisorShapeOverride>>;
   spec: HatSkeletonSpec;
+  /** Optional front crown decal (logo); embedded in GLB as mesh `Decal_Logo` when present. */
+  decal?: HatDecalPersisted;
 }
+
+export type { HatDecalPersisted };
 
 export interface HatlabStoreV1 {
   schemaVersion: 1;
@@ -86,12 +103,21 @@ export function finalizeSpecForVisorShape(
   const m = mergeHatSpecDefaults(spec);
   const patch = visorShapeOverrides[activeVisorShape]?.visor;
   const curve = VISOR_SHAPE_CURVATURE_MS[activeVisorShape];
+  const prevC = m.visor.visorCurvatureM ?? 0;
+  const K = VISOR_CURVATURE_PLANFORM_K;
+  const projection =
+    patch?.projection !== undefined
+      ? patch.projection
+      : Math.abs(curve - prevC) > 1e-12
+        ? (m.visor.projection * (1 + K * prevC)) / (1 + K * curve)
+        : m.visor.projection;
   return {
     ...m,
     visor: {
       ...m.visor,
       ...patch,
       visorCurvatureM: curve,
+      projection,
     },
   };
 }
@@ -113,6 +139,43 @@ export function createDefaultHatDocument(): HatDocument {
 
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null && !Array.isArray(x);
+}
+
+function parseOptionalDecal(raw: unknown): HatDecalPersisted | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!isRecord(raw)) throw new Error("Invalid decal");
+  if (typeof raw.panelIndex !== "number" || !Number.isFinite(raw.panelIndex)) {
+    throw new Error("Invalid decal.panelIndex");
+  }
+  if (!Array.isArray(raw.position) || raw.position.length !== 3) {
+    throw new Error("Invalid decal.position");
+  }
+  for (const x of raw.position) {
+    if (typeof x !== "number" || !Number.isFinite(x)) {
+      throw new Error("Invalid decal.position");
+    }
+  }
+  if (typeof raw.zRotation !== "number" || !Number.isFinite(raw.zRotation)) {
+    throw new Error("Invalid decal.zRotation");
+  }
+  if (!Array.isArray(raw.scale) || raw.scale.length !== 3) {
+    throw new Error("Invalid decal.scale");
+  }
+  for (const x of raw.scale) {
+    if (typeof x !== "number" || !Number.isFinite(x) || x <= 0) {
+      throw new Error("Invalid decal.scale");
+    }
+  }
+  if (typeof raw.imageDataUrl !== "string" || !raw.imageDataUrl) {
+    throw new Error("Invalid decal.imageDataUrl");
+  }
+  return {
+    panelIndex: raw.panelIndex,
+    position: raw.position as [number, number, number],
+    zRotation: raw.zRotation,
+    scale: raw.scale as [number, number, number],
+    imageDataUrl: raw.imageDataUrl,
+  };
 }
 
 function parseHatDocumentLoose(raw: unknown): HatDocument {
@@ -141,6 +204,11 @@ function parseHatDocumentLoose(raw: unknown): HatDocument {
   );
   const spec = mergeHatSpecDefaults(raw.spec as unknown as HatSkeletonSpec);
 
+  const decal =
+    "decal" in raw && raw.decal !== undefined
+      ? parseOptionalDecal(raw.decal)
+      : undefined;
+
   return {
     schemaVersion: 1,
     id: raw.id,
@@ -150,6 +218,7 @@ function parseHatDocumentLoose(raw: unknown): HatDocument {
     measurementBase,
     visorShapeOverrides,
     spec: finalizeSpecForVisorShape(spec, avs, visorShapeOverrides),
+    decal,
   };
 }
 

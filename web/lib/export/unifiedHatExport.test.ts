@@ -64,15 +64,31 @@ describe("buildFullHatExportRoot", () => {
       const visor0 = root.children[0]!;
       const modular = visor0.children[0]!;
       const px = "m1_flatcurve_hat_export_frame";
-      expect(modular.getObjectByName(`${px}_crown_front`)).toBeDefined();
-      expect(modular.getObjectByName(`${px}_crown_side`)).toBeDefined();
+      expect(
+        modular.getObjectByName(`${px}_crown_outer_crown_front`),
+      ).toBeDefined();
+      expect(
+        modular.getObjectByName(`${px}_crown_outer_crown_side`),
+      ).toBeDefined();
+      expect(
+        modular.getObjectByName(`${px}_crown_inner_crown_front_inner`),
+      ).toBeDefined();
+      expect(
+        modular.getObjectByName(`${px}_crown_inner_crown_side_inner`),
+      ).toBeDefined();
       expect(modular.getObjectByName(`${px}_fitted`)).toBeDefined();
       expect(modular.getObjectByName(`${px}_closure`)).toBeDefined();
       expect(
         modular.getObjectByName(`${px}_fitted_crown_rear`),
       ).toBeDefined();
       expect(
+        modular.getObjectByName(`${px}_fitted_crown_rear_inner`),
+      ).toBeDefined();
+      expect(
         modular.getObjectByName(`${px}_closure_crown_rear`),
+      ).toBeDefined();
+      expect(
+        modular.getObjectByName(`${px}_closure_crown_rear_inner`),
       ).toBeDefined();
       expect(
         modular.getObjectByName(`${px}_fitted_sweatband`),
@@ -82,6 +98,12 @@ describe("buildFullHatExportRoot", () => {
       ).toBeDefined();
       expect(
         modular.getObjectByName(`${px}_closure_hardware`),
+      ).toBeDefined();
+      expect(
+        modular.getObjectByName(`${px}_closure_hardware_snapback`),
+      ).toBeDefined();
+      expect(
+        modular.getObjectByName(`${px}_closure_hardware_velcro`),
       ).toBeDefined();
     },
     60_000,

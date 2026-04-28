@@ -120,14 +120,14 @@ describe("eyeletPanelIndices", () => {
     expect(eyeletPanelIndices(spec)).toEqual([0, 1, 2, 3, 4, 5]);
   });
 
-  it("5-panel mode (crownPanelMode 5, nSeams still 6): four panels, skip front 0", () => {
+  it("5-panel mode (crownPanelMode 5, nSeams still 6): four panels, skip front 0–1", () => {
     const spec: HatSkeletonSpec = {
       ...defaultHatSkeletonSpec(),
       nSeams: 6,
       crownPanelMode: 5,
       fivePanelCenterSeamLength: 0.36,
     };
-    expect(eyeletPanelIndices(spec)).toEqual([1, 2, 3, 4]);
+    expect(eyeletPanelIndices(spec)).toEqual([2, 3, 4, 5]);
   });
 
   it("native nSeams 5: four panels, skip front 0", () => {
@@ -148,7 +148,7 @@ describe("eyeletPanelIndices", () => {
       fivePanelCenterSeamLength: 0.36,
     } as HatSkeletonSpec);
     expect(merged.crownPanelMode).toBe(5);
-    expect(eyeletPanelIndices(merged)).toEqual([1, 2, 3, 4]);
+    expect(eyeletPanelIndices(merged)).toEqual([2, 3, 4, 5]);
   });
 });
 

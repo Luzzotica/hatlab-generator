@@ -216,6 +216,18 @@ export function ribbonGeometryOpen(
   const positions: number[] = [];
   const indices: number[] = [];
   const hw = halfWidth;
+
+  const arcLen: number[] = [0];
+  for (let i = 1; i < n; i++) {
+    const p = points[i]!;
+    const q = points[i - 1]!;
+    arcLen.push(
+      arcLen[i - 1]! + Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]),
+    );
+  }
+  const totalArc = arcLen[n - 1]!;
+  const uvs: number[] = [];
+
   for (let i = 0; i < n; i++) {
     const p = points[i]!;
     const w = widths[i]!;
@@ -227,6 +239,8 @@ export function ribbonGeometryOpen(
       p[1] - w[1] * hw,
       p[2] - w[2] * hw,
     );
+    const u = totalArc > 1e-12 ? arcLen[i]! / totalArc : i / Math.max(1, n - 1);
+    uvs.push(u, 1, u, 0);
   }
 
   for (let i = 0; i < n - 1; i++) {
@@ -239,6 +253,7 @@ export function ribbonGeometryOpen(
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
   geo.setIndex(indices);
   geo.computeVertexNormals();
   return geo;
@@ -332,6 +347,20 @@ export function ribbonGeometryOpenDualOrthogonal(
   const positions: number[] = [];
   const indices: number[] = [];
   const hw = halfWidth;
+
+  const arcLen: number[] = [0];
+  for (let i = 1; i < n; i++) {
+    const p = points[i]!;
+    const q = points[i - 1]!;
+    arcLen.push(
+      arcLen[i - 1]! + Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]),
+    );
+  }
+  const totalArc = arcLen[n - 1]!;
+  const uvs: number[] = [];
+  const uAt = (i: number) =>
+    totalArc > 1e-12 ? arcLen[i]! / totalArc : i / Math.max(1, n - 1);
+
   for (let i = 0; i < n; i++) {
     const p = points[i]!;
     const w = widths1[i]!;
@@ -343,6 +372,8 @@ export function ribbonGeometryOpenDualOrthogonal(
       p[1] - w[1] * hw,
       p[2] - w[2] * hw,
     );
+    const u = uAt(i);
+    uvs.push(u, 1, u, 0);
   }
   const strip2Base = (positions.length / 3) | 0;
   for (let i = 0; i < n; i++) {
@@ -356,6 +387,8 @@ export function ribbonGeometryOpenDualOrthogonal(
       p[1] - w[1] * hw,
       p[2] - w[2] * hw,
     );
+    const u = uAt(i);
+    uvs.push(u, 1, u, 0);
   }
 
   for (let i = 0; i < n - 1; i++) {
@@ -375,6 +408,7 @@ export function ribbonGeometryOpenDualOrthogonal(
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
   geo.setIndex(indices);
   geo.computeVertexNormals();
   return geo;

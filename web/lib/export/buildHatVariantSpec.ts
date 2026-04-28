@@ -25,6 +25,10 @@ export interface HatVariantBuildOptions {
 
 /**
  * Full skeleton for one export pass: solved for `visorIndex`, then eyelet + closure patched.
+ *
+ * We {@link finalizeSpecForVisorShape} **before** {@link solveHatSpecFromMeasurements} so the solver
+ * sees this branch’s `visorCurvatureM` (planform `b`, visor length, thread depth scales). A second
+ * finalize after solve re-applies per-shape visor patches on top of solved projection.
  */
 export function buildHatVariantSpec(
   doc: HatDocument,
@@ -36,7 +40,9 @@ export function buildHatVariantSpec(
     visorIndex,
     doc.visorShapeOverrides,
   );
-  let spec = solveHatSpecFromMeasurements(mergeHatSpecDefaults(doc.spec), mt);
+  let spec = mergeHatSpecDefaults(doc.spec);
+  spec = finalizeSpecForVisorShape(spec, visorIndex, doc.visorShapeOverrides);
+  spec = solveHatSpecFromMeasurements(spec, mt);
   spec = finalizeSpecForVisorShape(spec, visorIndex, doc.visorShapeOverrides);
 
   const backClosureOpening = !options.closureClosedBack;

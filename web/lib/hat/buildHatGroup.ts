@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import {
   buildSkeleton,
   effectiveVisorHalfSpanRad,
@@ -6,6 +7,7 @@ import {
   frontRisePanelIndices,
   frontGuideAlpha,
   frontGuideArcAndVIndices,
+  mergeHatSpecDefaults,
   sampleSeamWireframe,
   sampleVToArcGuideMeridian,
   sweatbandPoint,
@@ -14,6 +16,13 @@ import {
   type HatSkeletonSpec,
 } from "@/lib/skeleton";
 import {
+  CROWN_FRONT_INNER_MERGED_MESH_NAME,
+  CROWN_FRONT_MERGED_MESH_NAME,
+  CROWN_REAR_INNER_MERGED_MESH_NAME,
+  CROWN_REAR_MERGED_MESH_NAME,
+} from "@/lib/decal/crownDecal";
+import {
+  buildCrownPanelBridgeGeometries,
   buildCrownPanelGeometries,
   buildInnerFrontRiseGeometries,
   crownArcSegments,
@@ -30,6 +39,7 @@ import {
 import {
   buildSweatbandGeometry,
   type BackClosureTuckLiftParams,
+  type SweatbandGeometryOptions,
   type VisorTuckLiftParams,
 } from "@/lib/mesh/sweatbandMesh";
 import { rimWorldXYToSweatbandTheta } from "@/lib/mesh/sweatbandMesh";
@@ -54,6 +64,77 @@ import { buildHatVariantSpec } from "@/lib/export/buildHatVariantSpec";
 import type { HatDocument, VisorShapeIndex } from "@/lib/hat/hatDocument";
 
 const SEAM_SEGMENTS = 40;
+
+function mergeNonEmptyCrownGeometries(
+  geos: THREE.BufferGeometry[],
+): THREE.BufferGeometry {
+  const parts = geos.filter((g) => {
+    const pos = g.getAttribute("position");
+    return pos !== null && pos.count > 0;
+  });
+  if (parts.length === 0) {
+    throw new Error("merge: no non-empty crown geometries");
+  }
+  const merged = mergeGeometries(parts);
+  if (!merged) throw new Error("merge: mergeGeometries returned null");
+  return merged;
+}
+
+function mergeCrownGeometriesByIndices(
+  geos: THREE.BufferGeometry[],
+  indices: number[],
+): THREE.BufferGeometry {
+  return mergeNonEmptyCrownGeometries(indices.map((i) => geos[i]!));
+}
+
+/**
+ * Under `parent`, adds `Hardware` → `Snapback` and `Hardware` → `Velcro` so GLB always includes both
+ * closure meshes (independent of the document’s selected closure). No-op when the rear is closed.
+ */
+function addExportClosureHardwareVariants(
+  parent: THREE.Object3D,
+  baseSpec: HatSkeletonSpec,
+): void {
+  if (!baseSpec.backClosureOpening) return;
+  const specSnap = mergeHatSpecDefaults({
+    ...baseSpec,
+    closures: [{ type: "snapback" }],
+  });
+  const specVelcro = mergeHatSpecDefaults({
+    ...baseSpec,
+    closures: [{ type: "velcro" }],
+  });
+  const skSnap = buildSkeleton(specSnap);
+  const skVelcro = buildSkeleton(specVelcro);
+  const hardwareRoot = new THREE.Group();
+  hardwareRoot.name = "Hardware";
+  const snap = buildClosureGroup(skSnap, { allowedKinds: ["snapback"] });
+  snap.name = "Snapback";
+  const vel = buildClosureGroup(skVelcro, { allowedKinds: ["velcro"] });
+  vel.name = "Velcro";
+  hardwareRoot.add(snap);
+  hardwareRoot.add(vel);
+  parent.add(hardwareRoot);
+}
+
+function addSweatbandExportSplit(
+  parent: THREE.Group,
+  sk: BuiltSkeleton,
+  mat: THREE.MeshStandardMaterial,
+  options: Omit<SweatbandGeometryOptions, "shell">,
+): void {
+  const outerGeo = buildSweatbandGeometry(sk, { ...options, shell: "outer" });
+  const innerGeo = buildSweatbandGeometry(sk, { ...options, shell: "inner" });
+  const group = new THREE.Group();
+  group.name = "Sweatband";
+  const outerMesh = new THREE.Mesh(outerGeo, mat);
+  outerMesh.name = "Sweatband_Outer";
+  const innerMesh = new THREE.Mesh(innerGeo, mat);
+  innerMesh.name = "Sweatband_Inner";
+  group.add(outerMesh);
+  group.add(innerMesh);
+  parent.add(group);
+}
 
 /**
  * When true, viewer adds guide lines (rim, seam wireframes, orange ruler grid, visor outline, apex cross).
@@ -379,24 +460,54 @@ export function buildHatGroup(sk: BuiltSkeleton): THREE.Group {
   // (rim horizontal in XZ, crown toward +Y) instead of lying on its side in the default view.
   root.rotation.x = -Math.PI / 2;
 
-  const crownMat = new THREE.MeshStandardMaterial({
+  const crownMatOuter = new THREE.MeshStandardMaterial({
+    color: 0x6b7280,
+    flatShading: false,
+    side: THREE.FrontSide,
+    metalness: 0.1,
+    roughness: 0.85,
+  });
+  const crownMatInner = new THREE.MeshStandardMaterial({
+    color: 0x6b7280,
+    flatShading: false,
+    side: THREE.FrontSide,
+    metalness: 0.1,
+    roughness: 0.85,
+  });
+  const panelGeosOuter = buildCrownPanelGeometries(sk, "outer");
+  const panelGeosInner = buildCrownPanelGeometries(sk, "inner");
+  const panelGeosBridge = buildCrownPanelBridgeGeometries(sk);
+  const crownMatBridge = new THREE.MeshStandardMaterial({
     color: 0x6b7280,
     flatShading: false,
     side: THREE.DoubleSide,
     metalness: 0.1,
     roughness: 0.85,
   });
-  const panelGeos = buildCrownPanelGeometries(sk);
   const crownGroup = new THREE.Group();
   crownGroup.name = "Crown";
-  panelGeos.forEach((geo, i) => {
-    const mesh = new THREE.Mesh(geo, crownMat);
+  panelGeosOuter.forEach((geo, i) => {
+    const mesh = new THREE.Mesh(geo, crownMatOuter);
     mesh.name = `Panel_${i}`;
+    crownGroup.add(mesh);
+  });
+  panelGeosInner.forEach((geo, i) => {
+    const pos = geo.getAttribute("position");
+    if (!pos || pos.count === 0) return;
+    const mesh = new THREE.Mesh(geo, crownMatInner);
+    mesh.name = `Panel_${i}_Inner`;
+    crownGroup.add(mesh);
+  });
+  panelGeosBridge.forEach((geo, i) => {
+    const pos = geo.getAttribute("position");
+    if (!pos || pos.count === 0) return;
+    const mesh = new THREE.Mesh(geo, crownMatBridge);
+    mesh.name = `Panel_${i}_Bridge`;
     crownGroup.add(mesh);
   });
   root.add(crownGroup);
   if (sk.spec.eyeletStyle !== "none") {
-    root.add(buildEyeletGroup(sk, panelGeos));
+    root.add(buildEyeletGroup(sk, panelGeosOuter));
   }
   root.add(buildInnerFrontRiseGroup(sk));
   root.add(buildTopButtonMesh(sk));
@@ -711,7 +822,10 @@ export const HAT_EXPORT_GROUP_ROOT_ROTATION_Y = Math.PI;
 
 /**
  * Export-only group: physical hat parts only (no debug lines or guide wireframes).
- * Hierarchy: Hat (yaw) → HatExportFrame (pitch) → Crown (Panel_0…N), Eyelets (optional), InnerFrontRise, TopButton, Sweatband, SeamTape (…), Threading, Closures (optional), Visor (Bottom, Fillet, Tuck, Top), BillRope.
+ * Hierarchy: Hat (yaw) → HatExportFrame (pitch) → `Crown_Outer` / `Crown_Inner` (outer + inner shells split;
+ * merged front/rear + side `Panel_*`), Eyelets (optional), TopButton, `Sweatband` (`Sweatband_Outer` /
+ * `Sweatband_Inner`), SeamTape (…), Threading,
+ * Closures (optional), Visor (Bottom, Fillet, Tuck, Top), BillRope.
  */
 export function buildHatExportGroup(spec: HatSkeletonSpec): THREE.Group {
   const sk = buildSkeleton(spec);
@@ -723,34 +837,118 @@ export function buildHatExportGroup(spec: HatSkeletonSpec): THREE.Group {
   frame.rotation.x = HAT_EXPORT_GROUP_ROOT_ROTATION_X;
   root.add(frame);
 
-  const crownMat = new THREE.MeshStandardMaterial({
+  /** Match {@link buildHatGroup} viewer: single-sided shells so inner back faces are culled through holes; bridges stay two-sided. */
+  const crownMatOuter = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    flatShading: false,
+    side: THREE.FrontSide,
+    metalness: 0,
+    roughness: 1,
+  });
+  const crownMatInner = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    flatShading: false,
+    side: THREE.FrontSide,
+    metalness: 0,
+    roughness: 1,
+  });
+  const crownMatBridge = new THREE.MeshStandardMaterial({
     color: 0xffffff,
     flatShading: false,
     side: THREE.DoubleSide,
     metalness: 0,
     roughness: 1,
   });
-  const panelGeos = buildCrownPanelGeometries(sk);
-  const crownGroup = new THREE.Group();
-  crownGroup.name = "Crown";
-  panelGeos.forEach((geo, i) => {
-    const mesh = new THREE.Mesh(geo, crownMat);
-    mesh.name = `Panel_${i}`;
-    crownGroup.add(mesh);
+  /** Front-rise liner only — matches {@link buildInnerFrontRiseGroup} (not split crown inner shells). */
+  const crownMatInnerFrontRise = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    flatShading: false,
+    side: THREE.DoubleSide,
+    metalness: 0,
+    roughness: 1,
   });
-  frame.add(crownGroup);
-  if (sk.spec.eyeletStyle !== "none") {
-    frame.add(buildEyeletGroup(sk, panelGeos));
+  const panelGeosForEyelets = buildCrownPanelGeometries(sk);
+  const panelGeosOuter = buildCrownPanelGeometries(sk, "outer");
+  const panelGeosInner = buildCrownPanelGeometries(sk, "inner");
+  const panelGeosBridges = buildCrownPanelBridgeGeometries(sk);
+  const innerFrontRiseGeos = buildInnerFrontRiseGeometries(sk);
+  const n = sk.spec.nSeams;
+  const frontIdx = frontRisePanelIndices(n);
+  const { leftPanel, rightPanel } = getRearClosureAdjacentPanelIndices(n);
+  const rearIdx = [leftPanel, rightPanel].sort((a, b) => a - b);
+  const mergedFrontOuter = mergeCrownGeometriesByIndices(panelGeosOuter, frontIdx);
+  const mergedRearOuter = mergeCrownGeometriesByIndices(panelGeosOuter, rearIdx);
+  const mergedFrontInner = mergeNonEmptyCrownGeometries(innerFrontRiseGeos);
+  const mergedRearInner = mergeCrownGeometriesByIndices(panelGeosInner, rearIdx);
+  const mergedFrontBridge = mergeCrownGeometriesByIndices(panelGeosBridges, frontIdx);
+  const mergedRearBridge = mergeCrownGeometriesByIndices(panelGeosBridges, rearIdx);
+
+  const crownOuterGroup = new THREE.Group();
+  crownOuterGroup.name = "Crown_Outer";
+  const crownFrontOuterMesh = new THREE.Mesh(mergedFrontOuter, crownMatOuter);
+  crownFrontOuterMesh.name = CROWN_FRONT_MERGED_MESH_NAME;
+  crownOuterGroup.add(crownFrontOuterMesh);
+  const crownRearOuterMesh = new THREE.Mesh(mergedRearOuter, crownMatOuter);
+  crownRearOuterMesh.name = CROWN_REAR_MERGED_MESH_NAME;
+  crownOuterGroup.add(crownRearOuterMesh);
+  for (let i = 0; i < n; i++) {
+    if (frontIdx.includes(i)) continue;
+    if (rearIdx.includes(i)) continue;
+    const g = panelGeosOuter[i]!;
+    const pos = g.getAttribute("position");
+    if (!pos || pos.count === 0) continue;
+    const mesh = new THREE.Mesh(g, crownMatOuter);
+    mesh.name = `Panel_${i}`;
+    crownOuterGroup.add(mesh);
   }
-  frame.add(buildInnerFrontRiseGroup(sk, crownMat));
+  frame.add(crownOuterGroup);
+
+  const crownInnerGroup = new THREE.Group();
+  crownInnerGroup.name = "Crown_Inner";
+  const crownFrontInnerMesh = new THREE.Mesh(mergedFrontInner, crownMatInnerFrontRise);
+  crownFrontInnerMesh.name = CROWN_FRONT_INNER_MERGED_MESH_NAME;
+  crownInnerGroup.add(crownFrontInnerMesh);
+  const crownRearInnerMesh = new THREE.Mesh(mergedRearInner, crownMatInner);
+  crownRearInnerMesh.name = CROWN_REAR_INNER_MERGED_MESH_NAME;
+  crownInnerGroup.add(crownRearInnerMesh);
+  for (let i = 0; i < n; i++) {
+    if (frontIdx.includes(i)) continue;
+    if (rearIdx.includes(i)) continue;
+    const g = panelGeosInner[i]!;
+    const pos = g.getAttribute("position");
+    if (!pos || pos.count === 0) continue;
+    const mesh = new THREE.Mesh(g, crownMatInner);
+    mesh.name = `Panel_${i}_Inner`;
+    crownInnerGroup.add(mesh);
+  }
+  frame.add(crownInnerGroup);
+
+  const crownBridgeGroup = new THREE.Group();
+  crownBridgeGroup.name = "Crown_Bridges";
+  const crownFrontBridgeMesh = new THREE.Mesh(mergedFrontBridge, crownMatBridge);
+  crownFrontBridgeMesh.name = "Crown_Front_Bridge";
+  crownBridgeGroup.add(crownFrontBridgeMesh);
+  const crownRearBridgeMesh = new THREE.Mesh(mergedRearBridge, crownMatBridge);
+  crownRearBridgeMesh.name = "Crown_Rear_Bridge";
+  crownBridgeGroup.add(crownRearBridgeMesh);
+  for (let i = 0; i < n; i++) {
+    if (frontIdx.includes(i)) continue;
+    if (rearIdx.includes(i)) continue;
+    const g = panelGeosBridges[i]!;
+    const pos = g.getAttribute("position");
+    if (!pos || pos.count === 0) continue;
+    const mesh = new THREE.Mesh(g, crownMatBridge);
+    mesh.name = `Panel_${i}_Bridge`;
+    crownBridgeGroup.add(mesh);
+  }
+  frame.add(crownBridgeGroup);
+
+  if (sk.spec.eyeletStyle !== "none") {
+    frame.add(buildEyeletGroup(sk, panelGeosForEyelets));
+  }
   frame.add(buildTopButtonMesh(sk));
 
   const exportLiftParams = visorTuckLiftParams(sk);
-  const sweatbandGeo = buildSweatbandGeometry(sk, {
-    closure: sk.spec.backClosureOpening === true,
-    lift: exportLiftParams,
-    backClosureTuck: backClosureTuckLiftParams(sk),
-  });
   const sweatbandMat = new THREE.MeshStandardMaterial({
     color: 0xffffff,
     flatShading: false,
@@ -758,9 +956,11 @@ export function buildHatExportGroup(spec: HatSkeletonSpec): THREE.Group {
     metalness: 0,
     roughness: 1,
   });
-  const sweatband = new THREE.Mesh(sweatbandGeo, sweatbandMat);
-  sweatband.name = "Sweatband";
-  frame.add(sweatband);
+  addSweatbandExportSplit(frame, sk, sweatbandMat, {
+    closure: sk.spec.backClosureOpening === true,
+    lift: exportLiftParams,
+    backClosureTuck: backClosureTuckLiftParams(sk),
+  });
 
   let exportVisorSlabGeometries: VisorThreadingGeometries | undefined;
   if (sk.visorPolyline.length >= 2) {
@@ -772,7 +972,7 @@ export function buildHatExportGroup(spec: HatSkeletonSpec): THREE.Group {
 
   frame.add(buildSeamTapeGroup(sk));
   frame.add(buildThreadingGroup(sk, exportVisorSlabGeometries));
-  frame.add(buildClosureGroup(sk));
+  addExportClosureHardwareVariants(frame, sk.spec);
 
   if (sk.visorPolyline.length >= 2) {
     const visorMat = new THREE.MeshStandardMaterial({
@@ -819,11 +1019,9 @@ export function buildHatExportGroup(spec: HatSkeletonSpec): THREE.Group {
 }
 
 /**
- * Full-hat GLB export: crown in `Crown_Front` / `Crown_Side` / `Crown_Rear` (rear under slots) +
- * two slot groups. `Fitted` holds rear crown (closed), sweatband, seam tape, and threading for
- * no-opening mode; `Closure` holds the same four plus snapback hardware. Toggle `Fitted.visible` /
- * `Closure.visible` to swap modes. Also: inner rise, top button, eyelets, visor. Export pose:
- * parent yaw + child pitch (see {@link buildHatExportGroup}).
+ * Full-hat GLB export: `Crown_Outer` / `Crown_Inner` (split shells); merged front/rear + side groups.
+ * `Fitted` / `Closure` each hold outer + inner rear crowns, sweatband, seam tape, threading; `Closure`
+ * adds hardware. Top button, eyelets, visor. Export pose: parent yaw + child pitch (see {@link buildHatExportGroup}).
  */
 export function buildHatExportGroupModular(
   doc: HatDocument,
@@ -845,13 +1043,18 @@ export function buildHatExportGroupModular(
 
   const skF = buildSkeleton(specFitted);
   const skC = buildSkeleton(specClosureSurface);
-  const skCHw = buildSkeleton(specClosureHw);
 
   const n = skF.spec.nSeams;
   const { leftPanel, rightPanel } = getRearClosureAdjacentPanelIndices(n);
 
-  const panelGeosF = buildCrownPanelGeometries(skF);
-  const panelGeosC = buildCrownPanelGeometries(skC);
+  const panelGeosOuterF = buildCrownPanelGeometries(skF, "outer");
+  const panelGeosInnerF = buildCrownPanelGeometries(skF, "inner");
+  const panelGeosBridgeF = buildCrownPanelBridgeGeometries(skF);
+  const panelGeosOuterC = buildCrownPanelGeometries(skC, "outer");
+  const panelGeosInnerC = buildCrownPanelGeometries(skC, "inner");
+  const panelGeosBridgeC = buildCrownPanelBridgeGeometries(skC);
+  const innerFrontRiseGeos = buildInnerFrontRiseGeometries(skF);
+  const mergedFrontInner = mergeNonEmptyCrownGeometries(innerFrontRiseGeos);
 
   const root = new THREE.Group();
   root.name = "HatExportModular";
@@ -861,7 +1064,28 @@ export function buildHatExportGroupModular(
   frame.rotation.x = HAT_EXPORT_GROUP_ROOT_ROTATION_X;
   root.add(frame);
 
-  const crownMat = new THREE.MeshStandardMaterial({
+  const crownMatOuter = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    flatShading: false,
+    side: THREE.FrontSide,
+    metalness: 0,
+    roughness: 1,
+  });
+  const crownMatInner = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    flatShading: false,
+    side: THREE.FrontSide,
+    metalness: 0,
+    roughness: 1,
+  });
+  const crownMatBridge = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    flatShading: false,
+    side: THREE.DoubleSide,
+    metalness: 0,
+    roughness: 1,
+  });
+  const crownMatInnerFrontRise = new THREE.MeshStandardMaterial({
     color: 0xffffff,
     flatShading: false,
     side: THREE.DoubleSide,
@@ -872,31 +1096,89 @@ export function buildHatExportGroupModular(
   const frontPanelSet = new Set(frontRisePanelIndices(n));
   const rearPanelSet = new Set([leftPanel, rightPanel]);
 
-  const crownFront = new THREE.Group();
-  crownFront.name = "Crown_Front";
+  const frontOrder = [...frontPanelSet].sort((a, b) => a - b);
+  const mergedFrontOuter = mergeCrownGeometriesByIndices(panelGeosOuterF, frontOrder);
+  const mergedFrontBridge = mergeCrownGeometriesByIndices(panelGeosBridgeF, frontOrder);
+
+  const crownOuterGroup = new THREE.Group();
+  crownOuterGroup.name = "Crown_Outer";
+  const crownFrontMesh = new THREE.Mesh(mergedFrontOuter, crownMatOuter);
+  crownFrontMesh.name = CROWN_FRONT_MERGED_MESH_NAME;
+  crownOuterGroup.add(crownFrontMesh);
+
   const crownSide = new THREE.Group();
   crownSide.name = "Crown_Side";
   for (let i = 0; i < n; i++) {
     if (rearPanelSet.has(i)) continue;
-    const mesh = new THREE.Mesh(panelGeosF[i]!, crownMat);
+    if (frontPanelSet.has(i)) continue;
+    const g = panelGeosOuterF[i]!;
+    const pos = g.getAttribute("position");
+    if (!pos || pos.count === 0) continue;
+    const mesh = new THREE.Mesh(g, crownMatOuter);
     mesh.name = `Panel_${i}`;
-    if (frontPanelSet.has(i)) crownFront.add(mesh);
-    else crownSide.add(mesh);
+    crownSide.add(mesh);
   }
-  frame.add(crownFront);
-  frame.add(crownSide);
+  crownOuterGroup.add(crownSide);
+  frame.add(crownOuterGroup);
+
+  const crownBridgeGroup = new THREE.Group();
+  crownBridgeGroup.name = "Crown_Bridges";
+  const crownFrontBridgeMesh = new THREE.Mesh(mergedFrontBridge, crownMatBridge);
+  crownFrontBridgeMesh.name = "Crown_Front_Bridge";
+  crownBridgeGroup.add(crownFrontBridgeMesh);
+  const crownSideBridge = new THREE.Group();
+  crownSideBridge.name = "Crown_Side_Bridge";
+  for (let i = 0; i < n; i++) {
+    if (rearPanelSet.has(i)) continue;
+    if (frontPanelSet.has(i)) continue;
+    const g = panelGeosBridgeF[i]!;
+    const pos = g.getAttribute("position");
+    if (!pos || pos.count === 0) continue;
+    const mesh = new THREE.Mesh(g, crownMatBridge);
+    mesh.name = `Panel_${i}_Bridge`;
+    crownSideBridge.add(mesh);
+  }
+  crownBridgeGroup.add(crownSideBridge);
+  frame.add(crownBridgeGroup);
+
+  const crownInnerGroup = new THREE.Group();
+  crownInnerGroup.name = "Crown_Inner";
+  const crownFrontInnerMesh = new THREE.Mesh(mergedFrontInner, crownMatInnerFrontRise);
+  crownFrontInnerMesh.name = CROWN_FRONT_INNER_MERGED_MESH_NAME;
+  crownInnerGroup.add(crownFrontInnerMesh);
+
+  const crownSideInner = new THREE.Group();
+  crownSideInner.name = "Crown_Side_Inner";
+  for (let i = 0; i < n; i++) {
+    if (rearPanelSet.has(i)) continue;
+    if (frontPanelSet.has(i)) continue;
+    const g = panelGeosInnerF[i]!;
+    const pos = g.getAttribute("position");
+    if (!pos || pos.count === 0) continue;
+    const mesh = new THREE.Mesh(g, crownMatInner);
+    mesh.name = `Panel_${i}_Inner`;
+    crownSideInner.add(mesh);
+  }
+  crownInnerGroup.add(crownSideInner);
+  frame.add(crownInnerGroup);
+
+  const rearOrder = [leftPanel, rightPanel].sort((a, b) => a - b);
 
   const fitted = new THREE.Group();
   fitted.name = "Fitted";
 
-  const crownRearFitted = new THREE.Group();
-  crownRearFitted.name = "Crown_Rear";
-  for (const pi of [leftPanel, rightPanel]) {
-    const mesh = new THREE.Mesh(panelGeosF[pi]!, crownMat);
-    mesh.name = `Panel_${pi}`;
-    crownRearFitted.add(mesh);
-  }
-  fitted.add(crownRearFitted);
+  const mergedRearOuterF = mergeCrownGeometriesByIndices(panelGeosOuterF, rearOrder);
+  const mergedRearInnerF = mergeCrownGeometriesByIndices(panelGeosInnerF, rearOrder);
+  const mergedRearBridgeF = mergeCrownGeometriesByIndices(panelGeosBridgeF, rearOrder);
+  const crownRearMeshFitted = new THREE.Mesh(mergedRearOuterF, crownMatOuter);
+  crownRearMeshFitted.name = CROWN_REAR_MERGED_MESH_NAME;
+  fitted.add(crownRearMeshFitted);
+  const crownRearInnerMeshFitted = new THREE.Mesh(mergedRearInnerF, crownMatInner);
+  crownRearInnerMeshFitted.name = CROWN_REAR_INNER_MERGED_MESH_NAME;
+  fitted.add(crownRearInnerMeshFitted);
+  const crownRearBridgeMeshFitted = new THREE.Mesh(mergedRearBridgeF, crownMatBridge);
+  crownRearBridgeMeshFitted.name = "Crown_Rear_Bridge";
+  fitted.add(crownRearBridgeMeshFitted);
 
   const exportLiftParams = visorTuckLiftParams(skF);
   const sweatbandMat = new THREE.MeshStandardMaterial({
@@ -907,16 +1189,11 @@ export function buildHatExportGroupModular(
     roughness: 1,
   });
 
-  const sweatbandFitted = new THREE.Mesh(
-    buildSweatbandGeometry(skF, {
-      closure: false,
-      lift: exportLiftParams,
-      backClosureTuck: undefined,
-    }),
-    sweatbandMat,
-  );
-  sweatbandFitted.name = "Sweatband";
-  fitted.add(sweatbandFitted);
+  addSweatbandExportSplit(fitted, skF, sweatbandMat, {
+    closure: false,
+    lift: exportLiftParams,
+    backClosureTuck: undefined,
+  });
 
   let exportVisorSlabGeometries: VisorThreadingGeometries | undefined;
   if (skF.visorPolyline.length >= 2) {
@@ -939,25 +1216,24 @@ export function buildHatExportGroupModular(
   const closure = new THREE.Group();
   closure.name = "Closure";
 
-  const crownRearClosure = new THREE.Group();
-  crownRearClosure.name = "Crown_Rear";
-  for (const pi of [leftPanel, rightPanel]) {
-    const mesh = new THREE.Mesh(panelGeosC[pi]!, crownMat);
-    mesh.name = `Panel_${pi}`;
-    crownRearClosure.add(mesh);
-  }
-  closure.add(crownRearClosure);
+  const mergedRearOuterC = mergeCrownGeometriesByIndices(panelGeosOuterC, rearOrder);
+  const mergedRearInnerC = mergeCrownGeometriesByIndices(panelGeosInnerC, rearOrder);
+  const mergedRearBridgeC = mergeCrownGeometriesByIndices(panelGeosBridgeC, rearOrder);
+  const crownRearMeshClosure = new THREE.Mesh(mergedRearOuterC, crownMatOuter);
+  crownRearMeshClosure.name = CROWN_REAR_MERGED_MESH_NAME;
+  closure.add(crownRearMeshClosure);
+  const crownRearInnerMeshClosure = new THREE.Mesh(mergedRearInnerC, crownMatInner);
+  crownRearInnerMeshClosure.name = CROWN_REAR_INNER_MERGED_MESH_NAME;
+  closure.add(crownRearInnerMeshClosure);
+  const crownRearBridgeMeshClosure = new THREE.Mesh(mergedRearBridgeC, crownMatBridge);
+  crownRearBridgeMeshClosure.name = "Crown_Rear_Bridge";
+  closure.add(crownRearBridgeMeshClosure);
 
-  const sweatbandClosure = new THREE.Mesh(
-    buildSweatbandGeometry(skC, {
-      closure: true,
-      lift: exportLiftParams,
-      backClosureTuck: backClosureTuckLiftParams(skC),
-    }),
-    sweatbandMat,
-  );
-  sweatbandClosure.name = "Sweatband";
-  closure.add(sweatbandClosure);
+  addSweatbandExportSplit(closure, skC, sweatbandMat, {
+    closure: true,
+    lift: exportLiftParams,
+    backClosureTuck: backClosureTuckLiftParams(skC),
+  });
 
   const seamTapeClosure = buildSeamTapeGroup(skC);
   seamTapeClosure.name = "SeamTape";
@@ -967,13 +1243,10 @@ export function buildHatExportGroupModular(
   threadingClosure.name = "Threading";
   closure.add(threadingClosure);
 
-  const hardware = buildClosureGroup(skCHw);
-  hardware.name = "Hardware";
-  closure.add(hardware);
+  addExportClosureHardwareVariants(closure, specClosureHw);
 
   frame.add(closure);
 
-  frame.add(buildInnerFrontRiseGroup(skF, crownMat));
   frame.add(buildTopButtonMesh(skF));
 
   const specCloth = buildHatVariantSpec(doc, visorIndex, {

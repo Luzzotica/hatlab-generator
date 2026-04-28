@@ -4,6 +4,8 @@ import { validateSpec } from "@/lib/skeleton/types";
 import { disposeExportObject3D } from "@/lib/export/disposeExportObject3D";
 import { exportObjectToGLB } from "@/lib/export/gltf";
 import { resolveExportModelPrefix } from "@/lib/export/hatExportNaming";
+import { appendHatDecalToFullExport } from "@/lib/export/appendHatDecalExport";
+import { computeTangentsForExport } from "@/lib/export/prepareExportGeometry";
 import { buildFullHatExportRoot } from "@/lib/export/unifiedHatExport";
 
 /** Folder-safe segment for `{name}/{name}.glb` paths (matches single-hat export slug rules). */
@@ -32,9 +34,14 @@ async function glbBlobForHat(hat: HatDocument): Promise<Blob> {
   const root = buildFullHatExportRoot(hat, {
     modelPrefix: resolveExportModelPrefix(hat.name),
   });
-  const blob = await exportObjectToGLB(root);
-  disposeExportObject3D(root);
-  return blob;
+  const decalBaseTex = await appendHatDecalToFullExport(root, hat);
+  try {
+    computeTangentsForExport(root);
+    return await exportObjectToGLB(root);
+  } finally {
+    disposeExportObject3D(root);
+    decalBaseTex?.dispose();
+  }
 }
 
 /**

@@ -1,0 +1,1 @@
+/Users/sterlinglong/NonCloud/PAZA/Projects/hatlab-generator/.k2so/skills/k2so/SKILL.md

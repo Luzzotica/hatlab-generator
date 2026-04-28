@@ -34,6 +34,7 @@ import {
   solveHatSpecFromMeasurementsIncremental,
   visorSpanRange,
 } from "@/lib/skeleton";
+import { frontRisePanelIndices } from "@/lib/skeleton/geometry";
 import { resolveSeamEndpointStyleForIndex } from "@/lib/skeleton/geometry";
 import { buildHatExportGroup } from "@/lib/hat/buildHatGroup";
 import type { MeasurementFieldHighlight } from "@/lib/hat/measurementHighlight";
@@ -44,6 +45,7 @@ import {
   effectiveMeasurementTargets as mergeEffectiveMeasurementTargets,
   finalizeSpecForVisorShape,
   parseHatDocumentJSON,
+  parseHatlabStoreJSON,
   type HatDocument,
   readHatlabStore,
   serializeHatDocument,
@@ -52,6 +54,7 @@ import {
   VISOR_SHAPE_LABELS,
   writeHatlabStore,
 } from "@/lib/hat/hatDocument";
+import type { HatDecalPersisted } from "@/lib/decal/crownDecal";
 import { downloadTextFile } from "@/lib/export/downloadText";
 import { buildFullHatExportRoot } from "@/lib/export/unifiedHatExport";
 import { resolveExportModelPrefix } from "@/lib/export/hatExportNaming";
@@ -61,8 +64,34 @@ import {
   exportAllHatsToPickedDirectory,
   isFolderExportSupported,
 } from "@/lib/export/bulkHatGlbExport";
+import { buildAllHatsJsonZipBlob } from "@/lib/export/bulkHatJsonExport";
+import {
+  appendHatDecalToFullExport,
+  appendHatDecalToSimpleExport,
+} from "@/lib/export/appendHatDecalExport";
+import {
+  REAR_LASER_ETCH_LABELS,
+  type RearLaserEtchMode,
+} from "@/lib/hat/rearLaserEtch";
 
 type SeamGroupKey = "front" | "sideFront" | "sideBack" | "rear";
+
+const CLOSURE_OPTIONS = [
+  { type: "snapback" as const, label: "Snapback" },
+  { type: "velcro" as const, label: "Velcro" },
+  { type: "strapback" as const, label: "Strapback" },
+  { type: "metalSlide" as const, label: "Metal slide" },
+  { type: "shockCord" as const, label: "Shock cord" },
+] as const;
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result));
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(file);
+  });
+}
 
 function patchGroupEndpointStyle(
   spec: HatSkeletonSpec,
@@ -835,14 +864,22 @@ function Panel({
       >
         <div style={{ ...lab, marginTop: 0 }}>
           <span style={{ fontWeight: 600 }}>Back closure</span>
-          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              gap: 8,
+              marginTop: 8,
+            }}
+          >
             <button
               type="button"
               onClick={() =>
                 set({ backClosureOpening: false, closures: [] })
               }
               style={{
-                flex: 1,
+                flex: "1 1 28%",
+                minWidth: 64,
                 padding: "8px 10px",
                 borderRadius: 6,
                 border:
@@ -857,30 +894,38 @@ function Panel({
             >
               None
             </button>
-            <button
-              type="button"
-              onClick={() =>
-                set({
-                  backClosureOpening: true,
-                  closures: [{ type: "snapback" } satisfies HatClosureSpec],
-                })
-              }
-              style={{
-                flex: 1,
-                padding: "8px 10px",
-                borderRadius: 6,
-                border:
-                  spec.backClosureOpening
-                    ? "1px solid #3b82f6"
-                    : "1px solid #374151",
-                background: spec.backClosureOpening ? "#1e3a5f" : "#1f2937",
-                color: "#e5e7eb",
-                cursor: "pointer",
-                fontSize: 12,
-              }}
-            >
-              Snapback
-            </button>
+            {CLOSURE_OPTIONS.map((opt) => {
+              const active =
+                spec.backClosureOpening &&
+                spec.closures.some((c) => c.type === opt.type);
+              return (
+                <button
+                  key={opt.type}
+                  type="button"
+                  onClick={() =>
+                    set({
+                      backClosureOpening: true,
+                      closures: [{ type: opt.type } satisfies HatClosureSpec],
+                    })
+                  }
+                  style={{
+                    flex: "1 1 28%",
+                    minWidth: 64,
+                    padding: "8px 10px",
+                    borderRadius: 6,
+                    border: active
+                      ? "1px solid #3b82f6"
+                      : "1px solid #374151",
+                    background: active ? "#1e3a5f" : "#1f2937",
+                    color: "#e5e7eb",
+                    cursor: "pointer",
+                    fontSize: 12,
+                  }}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
           </div>
         </div>
         <div style={{ ...lab, marginTop: 8 }}>
@@ -966,12 +1011,56 @@ export function HatViewer() {
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevActiveHatIdRef = useRef<string | null>(null);
   const importFileRef = useRef<HTMLInputElement | null>(null);
+  const importBulkFilesRef = useRef<HTMLInputElement | null>(null);
+  const decalFileRef = useRef<HTMLInputElement | null>(null);
   const importModeRef = useRef<"replace" | "new">("replace");
+  const [decalTexture, setDecalTexture] = useState<THREE.Texture | null>(null);
+  const [rearLaserEtchMode, setRearLaserEtchMode] =
+    useState<RearLaserEtchMode>("none");
 
   const activeHat = useMemo(() => {
     const h = hats.find((x) => x.id === activeHatId);
     return h ?? hats[0]!;
   }, [hats, activeHatId]);
+
+  useEffect(() => {
+    const url = activeHat.decal?.imageDataUrl;
+    if (!url) {
+      setDecalTexture((prev) => {
+        prev?.dispose();
+        return null;
+      });
+      return;
+    }
+    const loader = new THREE.TextureLoader();
+    let cancelled = false;
+    loader.load(
+      url,
+      (tex) => {
+        tex.colorSpace = THREE.SRGBColorSpace;
+        if (cancelled) {
+          tex.dispose();
+          return;
+        }
+        setDecalTexture((prev) => {
+          prev?.dispose();
+          return tex;
+        });
+      },
+      undefined,
+      () => {
+        if (!cancelled) {
+          setDecalTexture((prev) => {
+            prev?.dispose();
+            return null;
+          });
+        }
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [activeHat.decal?.imageDataUrl]);
 
   const effectiveMeasurementTargets = useMemo(
     () =>
@@ -1050,6 +1139,29 @@ export function HatViewer() {
       if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
     };
   }, [activeHatId, hats]);
+
+  const patchDecal = useCallback(
+    (next: HatDecalPersisted) => {
+      setHats((hs) =>
+        hs.map((h) =>
+          h.id === activeHatId
+            ? { ...h, decal: next, updatedAt: Date.now() }
+            : h,
+        ),
+      );
+    },
+    [activeHatId],
+  );
+
+  const clearDecal = useCallback(() => {
+    setHats((hs) =>
+      hs.map((h) =>
+        h.id === activeHatId
+          ? { ...h, decal: undefined, updatedAt: Date.now() }
+          : h,
+      ),
+    );
+  }, [activeHatId]);
 
   const applySpecChange = useCallback(
     (patch: Partial<HatSkeletonSpec> | HatSkeletonSpec) => {
@@ -1261,12 +1373,59 @@ export function HatViewer() {
     [activeHatId],
   );
 
+  const importJsonFiles = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const added: HatDocument[] = [];
+    const failed: string[] = [];
+    for (const file of Array.from(files)) {
+      try {
+        const text = await file.text();
+        const raw = JSON.parse(text) as unknown;
+        const docs: HatDocument[] =
+          typeof raw === "object" &&
+          raw !== null &&
+          !Array.isArray(raw) &&
+          (raw as { schemaVersion?: unknown }).schemaVersion === 1 &&
+          Array.isArray((raw as { hats?: unknown }).hats)
+            ? parseHatlabStoreJSON(text).hats
+            : (() => {
+                const doc = parseHatDocumentJSON(text);
+                validateSpec(doc.spec);
+                return [doc];
+              })();
+        for (const doc of docs) {
+          try {
+            validateSpec(doc.spec);
+          } catch {
+            failed.push(`${file.name} (${doc.name})`);
+            continue;
+          }
+          added.push({
+            ...doc,
+            id: crypto.randomUUID(),
+            updatedAt: Date.now(),
+          });
+        }
+      } catch {
+        failed.push(file.name);
+      }
+    }
+    if (added.length > 0) {
+      setHats((hs) => [...hs, ...added]);
+      setActiveHatId(added[added.length - 1]!.id);
+    }
+    if (failed.length > 0) {
+      window.alert(`Could not import: ${failed.join(", ")}`);
+    }
+  }, []);
+
   const deferredSpec = useDeferredValue(activeHat.spec);
   const [measurementHighlight, setMeasurementHighlight] =
     useState<MeasurementFieldHighlight>(null);
   const [exporting, setExporting] = useState(false);
   const [exportingFull, setExportingFull] = useState(false);
   const [exportingAllZip, setExportingAllZip] = useState(false);
+  const [exportingAllJsonZip, setExportingAllJsonZip] = useState(false);
   const [exportingAllFolder, setExportingAllFolder] = useState(false);
   const [folderExportSupported, setFolderExportSupported] = useState(false);
 
@@ -1274,7 +1433,7 @@ export function HatViewer() {
     setFolderExportSupported(isFolderExportSupported());
   }, []);
 
-  const exportingAll = exportingAllZip || exportingAllFolder;
+  const exportingAll = exportingAllZip || exportingAllJsonZip || exportingAllFolder;
   const anyExportBusy = exporting || exportingFull || exportingAll;
 
   const onDownload = useCallback(async () => {
@@ -1286,8 +1445,10 @@ export function HatViewer() {
     setExporting(true);
     try {
       const g = buildHatExportGroup(activeHat.spec);
+      await appendHatDecalToSimpleExport(g, activeHat);
       computeTangentsForExport(g);
       const blob = await exportObjectToGLB(g);
+      downloadBlob(blob, "hat-skeleton.glb");
       g.traverse((o) => {
         if (o instanceof THREE.Mesh) {
           o.geometry.dispose();
@@ -1305,11 +1466,10 @@ export function HatViewer() {
           }
         }
       });
-      downloadBlob(blob, "hat-skeleton.glb");
     } finally {
       setExporting(false);
     }
-  }, [activeHat.spec]);
+  }, [activeHat]);
 
   const onExportFullHat = useCallback(async () => {
     try {
@@ -1322,12 +1482,18 @@ export function HatViewer() {
       const root = buildFullHatExportRoot(activeHat, {
         modelPrefix: resolveExportModelPrefix(activeHat.name),
       });
-      const blob = await exportObjectToGLB(root);
-      disposeExportObject3D(root);
-      const safe =
-        activeHat.name.replace(/[^\w\-]+/g, "-").replace(/^-|-$/g, "") ||
-        "hat";
-      downloadBlob(blob, `${safe}-full.glb`);
+      const decalBaseTex = await appendHatDecalToFullExport(root, activeHat);
+      try {
+        computeTangentsForExport(root);
+        const blob = await exportObjectToGLB(root);
+        const safe =
+          activeHat.name.replace(/[^\w\-]+/g, "-").replace(/^-|-$/g, "") ||
+          "hat";
+        downloadBlob(blob, `${safe}-full.glb`);
+      } finally {
+        disposeExportObject3D(root);
+        decalBaseTex?.dispose();
+      }
     } finally {
       setExportingFull(false);
     }
@@ -1359,6 +1525,35 @@ export function HatViewer() {
       }
     } finally {
       setExportingAllZip(false);
+    }
+  }, [hats]);
+
+  const onExportAllJsonZip = useCallback(async () => {
+    if (hats.length === 0) return;
+    setExportingAllJsonZip(true);
+    try {
+      const result = await buildAllHatsJsonZipBlob(hats);
+      if (result.exportedCount === 0) {
+        window.alert(
+          result.errors.length > 0
+            ? "No hats could be exported (all have invalid specs)."
+            : "No saved hats to export.",
+        );
+        return;
+      }
+      downloadBlob(result.blob, `hatlab-all-hats-json-${Date.now()}.zip`);
+      if (result.errors.length > 0) {
+        const lines = result.errors.slice(0, 15);
+        const more =
+          result.errors.length > 15
+            ? `\n… and ${result.errors.length - 15} more`
+            : "";
+        window.alert(
+          `Skipped ${result.errors.length} hat(s) with invalid spec:\n${lines.join("\n")}${more}`,
+        );
+      }
+    } finally {
+      setExportingAllJsonZip(false);
     }
   }, [hats]);
 
@@ -1437,6 +1632,17 @@ export function HatViewer() {
             if (f) importJsonFile(f, importModeRef.current);
           }}
         />
+        <input
+          ref={importBulkFilesRef}
+          type="file"
+          accept="application/json,.json"
+          multiple
+          style={{ display: "none" }}
+          onChange={(e) => {
+            void importJsonFiles(e.target.files);
+            e.target.value = "";
+          }}
+        />
         <div
           style={{
             boxSizing: "border-box",
@@ -1511,6 +1717,21 @@ export function HatViewer() {
             </button>
             <button
               type="button"
+              onClick={onExportAllJsonZip}
+              disabled={anyExportBusy || hats.length === 0}
+              style={{
+                ...btnStyle(),
+                opacity: hats.length === 0 ? 0.5 : 1,
+                cursor:
+                  anyExportBusy || hats.length === 0
+                    ? "not-allowed"
+                    : "pointer",
+              }}
+            >
+              {exportingAllJsonZip ? "Building ZIP…" : "Export all JSON (ZIP)"}
+            </button>
+            <button
+              type="button"
               onClick={() => {
                 importModeRef.current = "replace";
                 importFileRef.current?.click();
@@ -1528,6 +1749,13 @@ export function HatViewer() {
               style={btnStyle()}
             >
               Import as new
+            </button>
+            <button
+              type="button"
+              onClick={() => importBulkFilesRef.current?.click()}
+              style={btnStyle()}
+            >
+              Import JSON files…
             </button>
           </div>
         </div>
@@ -1631,6 +1859,140 @@ export function HatViewer() {
                 : "Export all hats to folder…"}
             </button>
           ) : null}
+          <div
+            style={{
+              marginTop: 12,
+              paddingTop: 12,
+              borderTop: "1px solid #27272a",
+            }}
+          >
+            <div
+              style={{
+                fontSize: 12,
+                fontWeight: 600,
+                marginBottom: 6,
+                color: "#e5e7eb",
+              }}
+            >
+              Rear crown etch (viewer test)
+            </div>
+            <p
+              style={{
+                margin: "0 0 8px",
+                opacity: 0.65,
+                fontSize: 11,
+                lineHeight: 1.35,
+              }}
+            >
+              Alpha-test cutout on side and rear crown panels (all gray fabric
+              except the front rise), not the neon seam tape (green) or
+              sweatband (magenta). Not exported in GLB.
+            </p>
+            <label style={{ ...lab, marginBottom: 8 }}>
+              Pattern
+              <select
+                value={rearLaserEtchMode}
+                onChange={(e) =>
+                  setRearLaserEtchMode(e.target.value as RearLaserEtchMode)
+                }
+                style={{
+                  marginTop: 4,
+                  padding: "6px 8px",
+                  borderRadius: 6,
+                  border: "1px solid #374151",
+                  background: "#1f2937",
+                  color: "#e5e7eb",
+                  fontSize: 12,
+                  width: "100%",
+                }}
+              >
+                {(Object.keys(REAR_LASER_ETCH_LABELS) as RearLaserEtchMode[]).map(
+                  (k) => (
+                    <option key={k} value={k}>
+                      {REAR_LASER_ETCH_LABELS[k]}
+                    </option>
+                  ),
+                )}
+              </select>
+            </label>
+          </div>
+          <div
+            style={{
+              marginTop: 12,
+              paddingTop: 12,
+              borderTop: "1px solid #27272a",
+            }}
+          >
+            <div
+              style={{
+                fontSize: 12,
+                fontWeight: 600,
+                marginBottom: 6,
+                color: "#e5e7eb",
+              }}
+            >
+              Front decal (logo)
+            </div>
+            <p
+              style={{
+                margin: "0 0 8px",
+                opacity: 0.65,
+                fontSize: 11,
+                lineHeight: 1.35,
+              }}
+            >
+              PNG with transparency works best. Alt+drag on the crown to move the
+              decal (avoids conflicting with orbit). Included in GLB as mesh{" "}
+              <span style={{ fontFamily: "monospace" }}>Decal_Logo</span> after
+              export.
+            </p>
+            <input
+              ref={decalFileRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              style={{ display: "none" }}
+              onChange={async (e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (!f) return;
+                try {
+                  const dataUrl = await readFileAsDataUrl(f);
+                  const front =
+                    frontRisePanelIndices(activeHat.spec.nSeams)[0] ?? 0;
+                  patchDecal({
+                    panelIndex: front,
+                    position: [0, 0, 0],
+                    zRotation: 0,
+                    scale: [0.06, 0.06, 0.06],
+                    imageDataUrl: dataUrl,
+                  });
+                } catch {
+                  window.alert("Could not read image file.");
+                }
+              }}
+            />
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              <button
+                type="button"
+                onClick={() => decalFileRef.current?.click()}
+                style={btnStyle()}
+              >
+                Choose image…
+              </button>
+              <button
+                type="button"
+                onClick={clearDecal}
+                disabled={!activeHat.decal}
+                style={{
+                  ...btnStyle(),
+                  opacity: !activeHat.decal ? 0.45 : 1,
+                  cursor: !activeHat.decal ? "not-allowed" : "pointer",
+                }}
+              >
+                Clear decal
+              </button>
+            </div>
+          </div>
         </div>
         <Panel
           spec={activeHat.spec}
@@ -1666,6 +2028,10 @@ export function HatViewer() {
             <HatModel
               spec={deferredSpec}
               measurementHighlight={measurementHighlight}
+              decal={activeHat.decal ?? null}
+              decalTexture={decalTexture}
+              onDecalChange={patchDecal}
+              rearLaserEtchMode={rearLaserEtchMode}
             />
             <OrbitControls makeDefault enableDamping dampingFactor={0.08} />
           </Suspense>

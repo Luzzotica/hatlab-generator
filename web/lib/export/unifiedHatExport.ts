@@ -1,7 +1,7 @@
 /**
  * Single GLB with four visor branches (`{model}_{flat_curve|…}`). Each branch is one modular export:
- * crown front/side groups + swappable rear panels + dual sweatbands / seam tape / threading +
- * hardware + eyelets (see {@link buildHatExportGroupModular}).
+ * `Crown_Outer` / `Crown_Inner` + swappable rear panels (outer + inner each) + dual sweatbands /
+ * seam tape / threading + hardware + eyelets (see {@link buildHatExportGroupModular}).
  */
 import * as THREE from "three";
 import { buildHatExportGroupModular } from "@/lib/hat/buildHatGroup";

@@ -1,9 +1,35 @@
 import * as THREE from "three";
 
+/**
+ * Vertex attributes allowed on exported glTF meshes. Most app-specific attrs are stripped so
+ * Blender and other importers do not see mixed custom types across primitives.
+ *
+ * **Laser etch (crown):** `laserPlaneMm` (vec2) and `laserEdgeDistMm` (vec4) are kept for
+ * downstream rendering (procedural holes + manufacturing masks). Meshes that never had them
+ * are unchanged.
+ *
+ * **Three.js glTF name transform:** non-standard attribute names are prefixed with `_` and
+ * uppercased in the file; `GLTFLoader` assigns geometry attributes in lowercase. After load,
+ * expect `_laserplanemm` / `_laseredgedistmm` unless you rename back to `laserPlaneMm` /
+ * `laserEdgeDistMm` for shader parity with HatLab.
+ *
+ * @see `web/docs/gltf-laser-vertex-attributes.md`
+ */
+const GLTF_PRESERVED_VERTEX_ATTRIBUTES = new Set([
+  "position",
+  "normal",
+  "uv",
+  "uv2",
+  "color",
+  "tangent",
+  "laserPlaneMm",
+  "laserEdgeDistMm",
+]);
+
 function attributeBackingArray(
   attr: THREE.BufferAttribute | THREE.InterleavedBufferAttribute,
 ): ArrayBufferView | undefined {
-  if (attr.isInterleavedBufferAttribute) {
+  if (attr instanceof THREE.InterleavedBufferAttribute) {
     return attr.data?.array;
   }
   return attr.array;
@@ -33,6 +59,10 @@ export function sanitizeGeometriesForGLTFExport(root: THREE.Object3D): void {
 
     const keys = Object.keys(geom.attributes);
     for (const key of keys) {
+      if (!GLTF_PRESERVED_VERTEX_ATTRIBUTES.has(key)) {
+        geom.deleteAttribute(key);
+        continue;
+      }
       const attr = geom.getAttribute(key);
       if (!attr) {
         geom.deleteAttribute(key);

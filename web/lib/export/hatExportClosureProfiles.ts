@@ -19,6 +19,10 @@ export interface HatExportClosureProfile {
 export const HAT_EXPORT_CLOSURE_PROFILES = [
   { id: "fitted", rearOpening: false, emitClosureHardware: false },
   { id: "snapback", rearOpening: true, emitClosureHardware: true },
+  { id: "velcro", rearOpening: true, emitClosureHardware: true },
+  { id: "strapback", rearOpening: true, emitClosureHardware: true },
+  { id: "metalSlide", rearOpening: true, emitClosureHardware: true },
+  { id: "shockCord", rearOpening: true, emitClosureHardware: true },
 ] as const satisfies readonly HatExportClosureProfile[];
 
 export type HatExportClosureProfileId =

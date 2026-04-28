@@ -4,7 +4,9 @@
  *
  * - **Crown panels:** u = meridian j/M, v = rim→apex k/N on outer/inner shells;
  *   rim/top bands use u along seam, v across shell thickness (0–1).
- * - **Inner front rise:** same (j/M, k/N) as crown inner grid.
+ * - **Inner front rise:** arc-length u,v on the inner shell (6-panel: one combined grid across both
+ *   front-rise panels); TEXCOORD_0 is then scaled isotropically (same m per u and v) so square
+ *   artwork does not stretch along one axis.
  * - **Sweatband:** u = arc length along strip (0–1), v = height up band (0–1).
  * - **Visor slabs / fillet / tuck:** u = span s (0–1), v = depth d (0–1) in ruled space.
  * - **Ribbons (tape, thread):** u along path (0–1 arc-length), v across width (0–1).

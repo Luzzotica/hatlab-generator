@@ -329,6 +329,12 @@ export type BackClosureTuckLiftParams = {
   right: VisorTuckLiftParams;
 };
 
+/**
+ * `full` = one closed shell (default). `outer` / `inner` = longitudinal faces only (export split so
+ * decals / textures do not project through both sides).
+ */
+export type SweatbandGeometryShell = "full" | "outer" | "inner";
+
 export type SweatbandGeometryOptions = {
   /** When true, mesh only the front arc between closure rails (no CSG). */
   closure?: boolean;
@@ -341,6 +347,8 @@ export type SweatbandGeometryOptions = {
    * Prefer this over {@link closureEdgeLift} for a glove-like wrap; do not pass both.
    */
   backClosureTuck?: BackClosureTuckLiftParams;
+  /** GLB export: emit only the outer or inner fabric surface (see {@link SweatbandGeometryShell}). */
+  shell?: SweatbandGeometryShell;
 };
 
 /**
@@ -489,6 +497,11 @@ export function buildSweatbandGeometry(
   const R = ringCount;
   const wrap = !openArc;
 
+  const shell = options.shell ?? "full";
+  const isFull = shell === "full";
+  const wantOuter = shell === "outer" || isFull;
+  const wantInner = shell === "inner" || isFull;
+
   const uAt = (i: number) =>
     wrap ? i / Math.max(1, nSeg) : i / Math.max(1, nSeg - 1);
   const vAt = (r: number) => r / Math.max(1, R - 1);
@@ -510,10 +523,60 @@ export function buildSweatbandGeometry(
       const vr = vAt(r);
       const vrp = vAt(r + 1);
 
-      pushQuad(positions, uvs, ob, obn, otn, ot, [ui, vr], [uj, vr], [uj, vrp], [ui, vrp]);
-      pushQuad(positions, uvs, ibn, ib, it, itn, [uj, vr], [ui, vr], [ui, vrp], [uj, vrp]);
-      pushQuad(positions, uvs, ob, ib, ibn, obn, [ui, 0], [ui, 1], [uj, 1], [uj, 0]);
-      pushQuad(positions, uvs, ot, otn, itn, it, [ui, 0], [uj, 0], [uj, 1], [ui, 1]);
+      if (wantOuter) {
+        pushQuad(
+          positions,
+          uvs,
+          ob,
+          obn,
+          otn,
+          ot,
+          [ui, vr],
+          [uj, vr],
+          [uj, vrp],
+          [ui, vrp],
+        );
+      }
+      if (wantInner) {
+        pushQuad(
+          positions,
+          uvs,
+          ibn,
+          ib,
+          it,
+          itn,
+          [uj, vr],
+          [ui, vr],
+          [ui, vrp],
+          [uj, vrp],
+        );
+      }
+      if (isFull) {
+        pushQuad(
+          positions,
+          uvs,
+          ob,
+          ib,
+          ibn,
+          obn,
+          [ui, 0],
+          [ui, 1],
+          [uj, 1],
+          [uj, 0],
+        );
+        pushQuad(
+          positions,
+          uvs,
+          ot,
+          otn,
+          itn,
+          it,
+          [ui, 0],
+          [uj, 0],
+          [uj, 1],
+          [ui, 1],
+        );
+      }
     }
   }
 
@@ -525,13 +588,89 @@ export function buildSweatbandGeometry(
       const it0 = innerCols[0]![r + 1]!;
       const vr = vAt(r);
       const vrp = vAt(r + 1);
-      pushQuad(positions, uvs, ob0, ib0, it0, ot0, [0, vr], [1, vr], [1, vrp], [0, vrp]);
+      if (isFull) {
+        pushQuad(
+          positions,
+          uvs,
+          ob0,
+          ib0,
+          it0,
+          ot0,
+          [0, vr],
+          [1, vr],
+          [1, vrp],
+          [0, vrp],
+        );
+      } else {
+        if (wantOuter) {
+          pushTriangle(
+            positions,
+            uvs,
+            ob0,
+            it0,
+            ot0,
+            [0, vr],
+            [1, vrp],
+            [0, vrp],
+          );
+        }
+        if (wantInner) {
+          pushTriangle(
+            positions,
+            uvs,
+            ob0,
+            ib0,
+            it0,
+            [0, vr],
+            [1, vr],
+            [1, vrp],
+          );
+        }
+      }
       const last = nSeg - 1;
       const obL = outerCols[last]![r]!;
       const otL = outerCols[last]![r + 1]!;
       const ibL = innerCols[last]![r]!;
       const itL = innerCols[last]![r + 1]!;
-      pushQuad(positions, uvs, obL, otL, itL, ibL, [0, vr], [0, vrp], [1, vrp], [1, vr]);
+      if (isFull) {
+        pushQuad(
+          positions,
+          uvs,
+          obL,
+          otL,
+          itL,
+          ibL,
+          [0, vr],
+          [0, vrp],
+          [1, vrp],
+          [1, vr],
+        );
+      } else {
+        if (wantOuter) {
+          pushTriangle(
+            positions,
+            uvs,
+            obL,
+            otL,
+            itL,
+            [0, vr],
+            [0, vrp],
+            [1, vrp],
+          );
+        }
+        if (wantInner) {
+          pushTriangle(
+            positions,
+            uvs,
+            obL,
+            itL,
+            ibL,
+            [0, vr],
+            [1, vrp],
+            [1, vr],
+          );
+        }
+      }
     }
   }
 

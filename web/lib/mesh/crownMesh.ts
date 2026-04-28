@@ -3,11 +3,15 @@ import type { HatSkeletonSpec } from "@/lib/skeleton/types";
 import type { BuiltSkeleton } from "@/lib/skeleton/geometry";
 import {
   closureLocalWH,
+  distanceToStadiumBoundaryOutsideMm,
   getBackClosureOpeningFrame,
   getClosureCutterDimensions,
   getRearClosureAdjacentPanelIndices,
   pointInsideStadiumOpening2D,
 } from "@/lib/mesh/backClosureSubtract";
+import {
+  LASER_MASK_INNER_SHELL_MM,
+} from "@/lib/hat/laserEtchMask";
 import { midpointUV } from "@/lib/hat/uvConventions";
 import {
   evalQuadraticBezier,
@@ -37,6 +41,14 @@ export const CROWN_SHELL_THICKNESS_M = 0.002;
 
 /** Half a millimetre in metres — mesh-edge / radial clearance scale used across hat geometry. */
 export const CROWN_MESH_HALF_MM_M = 0.0005;
+
+/**
+ * Extra weight on arc-length segments near seam columns (j≈0 and j≈M) when building panel u.
+ * Pure arc-length u plus global normalization can leave isotropic textures looking vertically
+ * smeared toward seams because u/v param lines are not orthogonal on the surface; this pulls
+ * more u span near the seams to keep circular alpha patterns rounder.
+ */
+const CROWN_UV_SEAM_U_STRETCH = 0.22;
 
 /**
  * Closure tunnel lip uses a slightly larger stadium than the cut mask so it overlaps
@@ -72,6 +84,26 @@ export function crownVerticalRings(spec: HatSkeletonSpec): number {
 
 type UVPair = [number, number];
 
+/** (left, right, rim, closureClearanceMm) per vertex for laser etch mask + plane. */
+type LaserEdge4 = [number, number, number, number];
+/** Panel plane mm: horizontal offset from panel mid (seam-to-seam), vertical from apex (meridian). */
+type LaserPlane2 = [number, number];
+
+function laserPlaneMmFromLrRim(
+  lr: [number, number, number],
+  meridianM: number,
+): LaserPlane2 {
+  const [left, right, rim] = lr;
+  return [(left - right) * 0.5, meridianM * 1000 - rim];
+}
+
+const INNER_LASER_MASK4: LaserEdge4 = [
+  LASER_MASK_INNER_SHELL_MM,
+  LASER_MASK_INNER_SHELL_MM,
+  LASER_MASK_INNER_SHELL_MM,
+  LASER_MASK_INNER_SHELL_MM,
+];
+
 function edgeLen3(
   a: [number, number, number],
   b: [number, number, number],
@@ -80,16 +112,27 @@ function edgeLen3(
 }
 
 /**
- * UVs from physical arc length on the outer grid so texture scale is ~uniform on the fabric
- * (parametric k/N and j/M compresses detail toward the apex and panel tip).
- * - v: cumulative length along a reference meridian jRef (panel mid).
- * - u: per row k, cumulative length from seam j=0 to j=M.
+ * UVs from physical arc length on the outer grid so texture scale is ~uniform on the fabric.
+ * - v: cumulative length along a reference meridian jRef (panel mid), normalized by total height.
+ * - u: cumulative arc length along each row k from seam j=0→M, with extra weight on segments near
+ *   seam columns (see seam stretch constant above) so seam-adjacent columns get more u span, then
+ *   divided by one **global**
+ *   scale (max seam-to-seam length over all rows). Per-row normalization was removed: mapping each
+ *   row to [0,1] u forced the same UV width for a short apex arc as for the wide rim, which
+ *   horizontally compressed tiled textures toward the panel tip.
  */
 function computeArcLengthUVTable(
   outer: [number, number, number][][],
   M: number,
   N: number,
-): { u: number[][]; v: number[] } {
+): {
+  u: number[][];
+  v: number[];
+  /** Max seam-to-seam arc length (m) before u normalization. */
+  uMaxM: number;
+  /** Reference meridian rim→apex arc length (m) before v normalization. */
+  meridianM: number;
+} {
   const jRef = Math.min(M, Math.max(0, Math.floor(M * 0.5)));
   const v: number[] = new Array(N + 1);
   v[0] = 0;
@@ -105,17 +148,80 @@ function computeArcLengthUVTable(
   for (let j = 0; j <= M; j++) {
     u[j] = new Array(N + 1);
   }
+  const mScale = Math.max(M, 1);
+  const seamStretchSeg = (jSeg: number) =>
+    1 +
+    CROWN_UV_SEAM_U_STRETCH *
+      Math.cos((Math.PI * (jSeg - 0.5)) / mScale) ** 2;
   for (let k = 0; k <= N; k++) {
     u[0]![k] = 0;
     acc = 0;
     for (let j = 1; j <= M; j++) {
-      acc += edgeLen3(outer[j - 1]![k]!, outer[j]![k]!);
+      const baseLen = edgeLen3(outer[j - 1]![k]!, outer[j]![k]!);
+      acc += baseLen * seamStretchSeg(j);
       u[j]![k] = acc;
     }
-    const totalU = acc > 1e-20 ? acc : 1;
-    for (let j = 0; j <= M; j++) u[j]![k]! /= totalU;
   }
-  return { u, v };
+  let uMax = 0;
+  for (let k = 0; k <= N; k++) {
+    uMax = Math.max(uMax, u[M]![k]!);
+  }
+  if (uMax < 1e-20) uMax = 1;
+  for (let k = 0; k <= N; k++) {
+    for (let j = 0; j <= M; j++) {
+      u[j]![k]! /= uMax;
+    }
+  }
+  return { u, v, uMaxM: uMax, meridianM: totalV };
+}
+
+/** Distances (mm) from left seam, right seam, and rim along the panel grid (outer shell). */
+function laserEdgeDistMmAtJK(
+  uTable: number[][],
+  vArr: number[],
+  j: number,
+  k: number,
+  M: number,
+  uMaxM: number,
+  meridianM: number,
+): [number, number, number] {
+  const left = uTable[j]![k]! * uMaxM * 1000;
+  const right = (uTable[M]![k]! - uTable[j]![k]!) * uMaxM * 1000;
+  const rim = vArr[k]! * meridianM * 1000;
+  return [left, right, rim];
+}
+
+function laserEdgeDistMmBilinear(
+  uTable: number[][],
+  vArr: number[],
+  jf: number,
+  kf: number,
+  M: number,
+  N: number,
+  uMaxM: number,
+  meridianM: number,
+): [number, number, number] {
+  const j0 = Math.max(0, Math.min(M, Math.floor(jf)));
+  const j1 = Math.max(0, Math.min(M, Math.ceil(jf)));
+  const k0 = Math.max(0, Math.min(N, Math.floor(kf)));
+  const k1 = Math.max(0, Math.min(N, Math.ceil(kf)));
+  const ja = jf - j0;
+  const ka = kf - k0;
+  const l00 = laserEdgeDistMmAtJK(uTable, vArr, j0, k0, M, uMaxM, meridianM);
+  const l10 = laserEdgeDistMmAtJK(uTable, vArr, j1, k0, M, uMaxM, meridianM);
+  const l01 = laserEdgeDistMmAtJK(uTable, vArr, j0, k1, M, uMaxM, meridianM);
+  const l11 = laserEdgeDistMmAtJK(uTable, vArr, j1, k1, M, uMaxM, meridianM);
+  const blend = (
+    a: [number, number, number],
+    b: [number, number, number],
+    c: [number, number, number],
+    d: [number, number, number],
+  ): [number, number, number] => [
+    (1 - ka) * ((1 - ja) * a[0] + ja * b[0]) + ka * ((1 - ja) * c[0] + ja * d[0]),
+    (1 - ka) * ((1 - ja) * a[1] + ja * b[1]) + ka * ((1 - ja) * c[1] + ja * d[1]),
+    (1 - ka) * ((1 - ja) * a[2] + ja * b[2]) + ka * ((1 - ja) * c[2] + ja * d[2]),
+  ];
+  return blend(l00, l10, l01, l11);
 }
 
 /** Bilinear u(j,k) and linear v(k) for fractional mesh coordinates (closure subdiv). */
@@ -146,15 +252,42 @@ function uvFromParametricJK(
 function pushTriangleWithUV(
   positions: number[],
   uvs: number[],
+  laserMm: number[] | null,
+  laserPlaneMm: number[] | null,
   a: [number, number, number],
   b: [number, number, number],
   c: [number, number, number],
   ua: UVPair,
   ub: UVPair,
   uc: UVPair,
+  la?: LaserEdge4,
+  lb?: LaserEdge4,
+  lc?: LaserEdge4,
+  pa?: LaserPlane2,
+  pb?: LaserPlane2,
+  pc?: LaserPlane2,
 ): void {
   positions.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]);
   uvs.push(ua[0], ua[1], ub[0], ub[1], uc[0], uc[1]);
+  if (laserMm !== null && la !== undefined && lb !== undefined && lc !== undefined) {
+    laserMm.push(
+      la[0],
+      la[1],
+      la[2],
+      la[3],
+      lb[0],
+      lb[1],
+      lb[2],
+      lb[3],
+      lc[0],
+      lc[1],
+      lc[2],
+      lc[3],
+    );
+  }
+  if (laserPlaneMm !== null && pa !== undefined && pb !== undefined && pc !== undefined) {
+    laserPlaneMm.push(pa[0], pa[1], pb[0], pb[1], pc[0], pc[1]);
+  }
 }
 
 function sub3(
@@ -734,6 +867,29 @@ export function buildBackClosureCutSpec(sk: BuiltSkeleton): BackClosureCutSpec {
   };
 }
 
+function laserClosureEdgeMmForVertex(
+  p: readonly [number, number, number],
+  cut: BackClosureCutSpec | undefined,
+  isClosurePanel: boolean,
+): number {
+  if (!cut || !isClosurePanel) return LASER_MASK_INNER_SHELL_MM;
+  const { lw, lh } = closureLocalWH(p, cut.rimAnchor, cut.tW, cut.tH);
+  if (pointInsideStadiumOpening2D(lw, lh, cut.widthM, cut.straightM)) {
+    return 0;
+  }
+  return distanceToStadiumBoundaryOutsideMm(lw, lh, cut.widthM, cut.straightM);
+}
+
+function laserEdgeWithClosureW(
+  base: [number, number, number],
+  p: [number, number, number],
+  cut: BackClosureCutSpec | undefined,
+  isClosurePanel: boolean,
+): LaserEdge4 {
+  const w = laserClosureEdgeMmForVertex(p, cut, isClosurePanel);
+  return [base[0], base[1], base[2], w];
+}
+
 const CLOSURE_SUBDIV_MAX_DEPTH = 4;
 
 function vertexInsideClosureOpening(
@@ -1200,11 +1356,17 @@ function buildClosureShellIndexedMeshes(
 function flushClosureParamMeshToPositions(
   positions: number[],
   uvs: number[],
+  laserMm: number[] | null,
+  laserPlaneMm: number[] | null,
   mesh: ClosureParamMesh,
   M: number,
   N: number,
   uTable: number[][],
   vArr: number[],
+  uMaxM: number,
+  meridianM: number,
+  cut: BackClosureCutSpec | undefined,
+  isClosurePanel: boolean,
 ): void {
   for (let t = 0; t < mesh.indices.length; t += 3) {
     const ia = mesh.indices[t]!;
@@ -1216,7 +1378,64 @@ function flushClosureParamMeshToPositions(
     const ua = uvFromParametricJK(uTable, vArr, mesh.jf[ia]!, mesh.kf[ia]!, M, N);
     const ub = uvFromParametricJK(uTable, vArr, mesh.jf[ib]!, mesh.kf[ib]!, M, N);
     const uc = uvFromParametricJK(uTable, vArr, mesh.jf[ic]!, mesh.kf[ic]!, M, N);
-    pushTriangleWithUV(positions, uvs, a, b, c, ua, ub, uc);
+    if (laserMm !== null && laserPlaneMm !== null) {
+      const la3 = laserEdgeDistMmBilinear(
+        uTable,
+        vArr,
+        mesh.jf[ia]!,
+        mesh.kf[ia]!,
+        M,
+        N,
+        uMaxM,
+        meridianM,
+      );
+      const lb3 = laserEdgeDistMmBilinear(
+        uTable,
+        vArr,
+        mesh.jf[ib]!,
+        mesh.kf[ib]!,
+        M,
+        N,
+        uMaxM,
+        meridianM,
+      );
+      const lc3 = laserEdgeDistMmBilinear(
+        uTable,
+        vArr,
+        mesh.jf[ic]!,
+        mesh.kf[ic]!,
+        M,
+        N,
+        uMaxM,
+        meridianM,
+      );
+      const ea = laserEdgeWithClosureW(la3, a, cut, isClosurePanel);
+      const eb = laserEdgeWithClosureW(lb3, b, cut, isClosurePanel);
+      const ec = laserEdgeWithClosureW(lc3, c, cut, isClosurePanel);
+      const pa = laserPlaneMmFromLrRim(la3, meridianM);
+      const pb = laserPlaneMmFromLrRim(lb3, meridianM);
+      const pc = laserPlaneMmFromLrRim(lc3, meridianM);
+      pushTriangleWithUV(
+        positions,
+        uvs,
+        laserMm,
+        laserPlaneMm,
+        a,
+        b,
+        c,
+        ua,
+        ub,
+        uc,
+        ea,
+        eb,
+        ec,
+        pa,
+        pb,
+        pc,
+      );
+    } else {
+      pushTriangleWithUV(positions, uvs, null, null, a, b, c, ua, ub, uc);
+    }
   }
 }
 
@@ -1287,6 +1506,8 @@ export function closureProjectToCrownOpening(
 function appendClosureTunnelWallParametric(
   positions: number[],
   uvs: number[],
+  laserMm: number[] | null,
+  laserPlaneMm: number[] | null,
   sk: BuiltSkeleton,
   cut: BackClosureCutSpec,
   M: number,
@@ -1366,8 +1587,48 @@ function appendClosureTunnelWallParametric(
     const vO1: UVPair = [u1, 0];
     const vI: UVPair = [u0, 1];
     const vI1: UVPair = [u1, 1];
-    pushTriangleWithUV(positions, uvs, o0, o1, i1, vO, vO1, vI1);
-    pushTriangleWithUV(positions, uvs, o0, i1, i0, vO, vI1, vI);
+    const zPlane: LaserPlane2 = [0, 0];
+    if (laserMm !== null && laserPlaneMm !== null) {
+      pushTriangleWithUV(
+        positions,
+        uvs,
+        laserMm,
+        laserPlaneMm,
+        o0,
+        o1,
+        i1,
+        vO,
+        vO1,
+        vI1,
+        INNER_LASER_MASK4,
+        INNER_LASER_MASK4,
+        INNER_LASER_MASK4,
+        zPlane,
+        zPlane,
+        zPlane,
+      );
+      pushTriangleWithUV(
+        positions,
+        uvs,
+        laserMm,
+        laserPlaneMm,
+        o0,
+        i1,
+        i0,
+        vO,
+        vI1,
+        vI,
+        INNER_LASER_MASK4,
+        INNER_LASER_MASK4,
+        INNER_LASER_MASK4,
+        zPlane,
+        zPlane,
+        zPlane,
+      );
+    } else {
+      pushTriangleWithUV(positions, uvs, null, null, o0, o1, i1, vO, vO1, vI1);
+      pushTriangleWithUV(positions, uvs, null, null, o0, i1, i0, vO, vI1, vI);
+    }
   }
 }
 
@@ -1392,8 +1653,8 @@ function appendRimOrTopQuadRecursive(
   const iD = vertexInsideClosureOpening(d, cut);
   if (iA && iB && iC && iD) return;
   if (!iA && !iB && !iC && !iD) {
-    pushTriangleWithUV(positions, uvs, a, d, b, ua, ud, ub);
-    pushTriangleWithUV(positions, uvs, b, d, c, ub, ud, uc);
+    pushTriangleWithUV(positions, uvs, null, null, a, d, b, ua, ud, ub);
+    pushTriangleWithUV(positions, uvs, null, null, b, d, c, ub, ud, uc);
     return;
   }
   if (depth >= CLOSURE_SUBDIV_MAX_DEPTH) {
@@ -1401,8 +1662,8 @@ function appendRimOrTopQuadRecursive(
     const my = midpoint3(b, d);
     const center = midpoint3(mx, my);
     if (!vertexInsideClosureOpening(center, cut)) {
-      pushTriangleWithUV(positions, uvs, a, d, b, ua, ud, ub);
-      pushTriangleWithUV(positions, uvs, b, d, c, ub, ud, uc);
+      pushTriangleWithUV(positions, uvs, null, null, a, d, b, ua, ud, ub);
+      pushTriangleWithUV(positions, uvs, null, null, b, d, c, ub, ud, uc);
     }
     return;
   }
@@ -1495,8 +1756,8 @@ function appendTopWallQuadRecursive(
   const iD = vertexInsideClosureOpening(d, cut);
   if (iA && iB && iC && iD) return;
   if (!iA && !iB && !iC && !iD) {
-    pushTriangleWithUV(positions, uvs, a, b, c, ua, ub, uc);
-    pushTriangleWithUV(positions, uvs, a, c, d, ua, uc, ud);
+    pushTriangleWithUV(positions, uvs, null, null, a, b, c, ua, ub, uc);
+    pushTriangleWithUV(positions, uvs, null, null, a, c, d, ua, uc, ud);
     return;
   }
   if (depth >= CLOSURE_SUBDIV_MAX_DEPTH) {
@@ -1504,8 +1765,8 @@ function appendTopWallQuadRecursive(
     const my = midpoint3(b, d);
     const center = midpoint3(mx, my);
     if (!vertexInsideClosureOpening(center, cut)) {
-      pushTriangleWithUV(positions, uvs, a, b, c, ua, ub, uc);
-      pushTriangleWithUV(positions, uvs, a, c, d, ua, uc, ud);
+      pushTriangleWithUV(positions, uvs, null, null, a, b, c, ua, ub, uc);
+      pushTriangleWithUV(positions, uvs, null, null, a, c, d, ua, uc, ud);
     }
     return;
   }
@@ -1577,15 +1838,136 @@ function appendTopWallQuadRecursive(
   );
 }
 
-function pushInnerSurfaceQuads(
+/** Rim strip (k=0) and top strip connecting outer and inner shells; omitted for split `"outer"` / `"inner"` panels unless added via {@link buildCrownPanelBridgeGeometries}. */
+function pushCrownPanelRimAndTopWalls(
   positions: number[],
   uvs: number[],
+  outer: [number, number, number][][],
   inner: [number, number, number][][],
   M: number,
   N: number,
   collapseTop: boolean,
   uTable: number[][],
   vArr: number[],
+  cut: BackClosureCutSpec | undefined,
+): void {
+  if (cut) {
+    for (let j = 0; j < M; j++) {
+      appendRimOrTopQuadRecursive(
+        positions,
+        uvs,
+        outer[j]![0]!,
+        outer[j + 1]![0]!,
+        inner[j + 1]![0]!,
+        inner[j]![0]!,
+        [uTable[j]![0]!, 0],
+        [uTable[j + 1]![0]!, 0],
+        [uTable[j + 1]![0]!, 1],
+        [uTable[j]![0]!, 1],
+        0,
+        cut,
+      );
+    }
+  } else {
+    for (let j = 0; j < M; j++) {
+      const ua: UVPair = [uTable[j]![0]!, 0];
+      const ub: UVPair = [uTable[j]![0]!, 1];
+      const uc: UVPair = [uTable[j + 1]![0]!, 0];
+      const ud: UVPair = [uTable[j + 1]![0]!, 1];
+      pushTriangleWithUV(
+        positions,
+        uvs,
+        null,
+        null,
+        outer[j]![0]!,
+        inner[j]![0]!,
+        outer[j + 1]![0]!,
+        ua,
+        ub,
+        uc,
+      );
+      pushTriangleWithUV(
+        positions,
+        uvs,
+        null,
+        null,
+        outer[j + 1]![0]!,
+        inner[j]![0]!,
+        inner[j + 1]![0]!,
+        uc,
+        ub,
+        ud,
+      );
+    }
+  }
+
+  {
+    const kTop = collapseTop ? N - 1 : N;
+    if (cut) {
+      for (let j = 0; j < M; j++) {
+        appendTopWallQuadRecursive(
+          positions,
+          uvs,
+          outer[j]![kTop]!,
+          outer[j + 1]![kTop]!,
+          inner[j + 1]![kTop]!,
+          inner[j]![kTop]!,
+          [uTable[j]![kTop]!, 0],
+          [uTable[j + 1]![kTop]!, 0],
+          [uTable[j + 1]![kTop]!, 1],
+          [uTable[j]![kTop]!, 1],
+          0,
+          cut,
+        );
+      }
+    } else {
+      for (let j = 0; j < M; j++) {
+        const ua: UVPair = [uTable[j]![kTop]!, 0];
+        const ub: UVPair = [uTable[j + 1]![kTop]!, 0];
+        const uc: UVPair = [uTable[j + 1]![kTop]!, 1];
+        const ud: UVPair = [uTable[j]![kTop]!, 1];
+        pushTriangleWithUV(
+          positions,
+          uvs,
+          null,
+          null,
+          outer[j]![kTop]!,
+          outer[j + 1]![kTop]!,
+          inner[j + 1]![kTop]!,
+          ua,
+          ub,
+          uc,
+        );
+        pushTriangleWithUV(
+          positions,
+          uvs,
+          null,
+          null,
+          outer[j]![kTop]!,
+          inner[j + 1]![kTop]!,
+          inner[j]![kTop]!,
+          ua,
+          uc,
+          ud,
+        );
+      }
+    }
+  }
+}
+
+function pushInnerSurfaceQuads(
+  positions: number[],
+  uvs: number[],
+  laserMm: number[] | null,
+  laserPlaneMm: number[] | null,
+  inner: [number, number, number][][],
+  M: number,
+  N: number,
+  collapseTop: boolean,
+  uTable: number[][],
+  vArr: number[],
+  uMaxM: number,
+  meridianM: number,
 ): void {
   for (let k = 0; k < N; k++) {
     const lastStrip = k === N - 1;
@@ -1598,11 +1980,85 @@ function pushInnerSurfaceQuads(
       const u10: UVPair = [uTable[j + 1]![k]!, vArr[k]!];
       const u01: UVPair = [uTable[j]![k + 1]!, vArr[k + 1]!];
       const u11: UVPair = [uTable[j + 1]![k + 1]!, vArr[k + 1]!];
+      const l00 = laserEdgeDistMmAtJK(uTable, vArr, j, k, M, uMaxM, meridianM);
+      const l10 = laserEdgeDistMmAtJK(uTable, vArr, j + 1, k, M, uMaxM, meridianM);
+      const l01 = laserEdgeDistMmAtJK(uTable, vArr, j, k + 1, M, uMaxM, meridianM);
+      const l11 = laserEdgeDistMmAtJK(
+        uTable,
+        vArr,
+        j + 1,
+        k + 1,
+        M,
+        uMaxM,
+        meridianM,
+      );
+      const p00 = laserPlaneMmFromLrRim(l00, meridianM);
+      const p10 = laserPlaneMmFromLrRim(l10, meridianM);
+      const p01 = laserPlaneMmFromLrRim(l01, meridianM);
+      const p11 = laserPlaneMmFromLrRim(l11, meridianM);
       if (!lastStrip || !collapseTop) {
-        pushTriangleWithUV(positions, uvs, i00, i01, i10, u00, u01, u10);
-        pushTriangleWithUV(positions, uvs, i10, i01, i11, u10, u01, u11);
+        if (laserMm !== null && laserPlaneMm !== null) {
+          pushTriangleWithUV(
+            positions,
+            uvs,
+            laserMm,
+            laserPlaneMm,
+            i00,
+            i01,
+            i10,
+            u00,
+            u01,
+            u10,
+            INNER_LASER_MASK4,
+            INNER_LASER_MASK4,
+            INNER_LASER_MASK4,
+            p00,
+            p01,
+            p10,
+          );
+          pushTriangleWithUV(
+            positions,
+            uvs,
+            laserMm,
+            laserPlaneMm,
+            i10,
+            i01,
+            i11,
+            u10,
+            u01,
+            u11,
+            INNER_LASER_MASK4,
+            INNER_LASER_MASK4,
+            INNER_LASER_MASK4,
+            p10,
+            p01,
+            p11,
+          );
+        } else {
+          pushTriangleWithUV(positions, uvs, null, null, i00, i01, i10, u00, u01, u10);
+          pushTriangleWithUV(positions, uvs, null, null, i10, i01, i11, u10, u01, u11);
+        }
+      } else if (laserMm !== null && laserPlaneMm !== null) {
+        pushTriangleWithUV(
+          positions,
+          uvs,
+          laserMm,
+          laserPlaneMm,
+          i00,
+          i01,
+          i10,
+          u00,
+          u01,
+          u10,
+          INNER_LASER_MASK4,
+          INNER_LASER_MASK4,
+          INNER_LASER_MASK4,
+          p00,
+          p01,
+          p10,
+        );
       } else {
-        pushTriangleWithUV(positions, uvs, i00, i01, i10, u00, u01, u10);
+        pushTriangleWithUV(positions, uvs, null, null, i00, i01, i10, u00, u01, u10);
       }
     }
   }
@@ -1649,34 +2105,153 @@ export function buildCrownGeometry(sk: BuiltSkeleton): THREE.BufferGeometry {
 }
 
 /**
+ * Combine adjacent front-rise panel grids (6-panel: panels 0 and 1) so the shared seam is one
+ * meridian column — one connected inner surface for export.
+ */
+function combineFrontRisePanelGrids(
+  outer0: [number, number, number][][],
+  inner0: [number, number, number][][],
+  outer1: [number, number, number][][],
+  inner1: [number, number, number][][],
+  M: number,
+): {
+  outer: [number, number, number][][];
+  inner: [number, number, number][][];
+  MCombined: number;
+} {
+  const MCombined = 2 * M;
+  const outer: [number, number, number][][] = new Array(MCombined + 1);
+  const inner: [number, number, number][][] = new Array(MCombined + 1);
+  for (let j = 0; j <= M; j++) {
+    outer[j] = outer0[j]!;
+    inner[j] = inner0[j]!;
+  }
+  for (let j = 1; j <= M; j++) {
+    outer[M + j] = outer1[j]!;
+    inner[M + j] = inner1[j]!;
+  }
+  return { outer, inner, MCombined };
+}
+
+/**
+ * Isotropic TEXCOORD_0 for inner front rise: same meters per UV unit in u and v so a square
+ * texture maps without anisotropic stretch (domain may be a sub-rectangle of [0,1]²).
+ */
+function applyIsotropicUvToInnerFrontRise(
+  uvs: number[],
+  uMaxM: number,
+  meridianM: number,
+): void {
+  const L = Math.max(uMaxM, meridianM);
+  if (L < 1e-20) return;
+  const su = uMaxM / L;
+  const sv = meridianM / L;
+  for (let i = 0; i < uvs.length; i += 2) {
+    uvs[i]! *= su;
+    uvs[i + 1]! *= sv;
+  }
+}
+
+/**
  * Inner fabric surface only for front rise panels (split from main crown shells for separate materials).
+ * Six-panel hats use one combined grid across both front-rise panels (single mesh, one UV island);
+ * five-panel uses a single panel as before.
  */
 export function buildInnerFrontRiseGeometries(
   sk: BuiltSkeleton,
 ): THREE.BufferGeometry[] {
   const { M, N, collapseTop } = getCrownMeshResolution(sk);
   const geos: THREE.BufferGeometry[] = [];
-  for (const panel of frontRisePanelIndices(sk.spec.nSeams)) {
-    const { outer, inner } = computePanelOuterInnerGrids(sk, panel, M, N);
-    const { u: uTable, v: vArr } = computeArcLengthUVTable(outer, M, N);
+
+  if (sk.spec.nSeams === 6) {
+    const { outer: o0, inner: i0 } = computePanelOuterInnerGrids(sk, 0, M, N);
+    const { outer: o1, inner: i1 } = computePanelOuterInnerGrids(sk, 1, M, N);
+    const { outer, inner, MCombined } = combineFrontRisePanelGrids(
+      o0,
+      i0,
+      o1,
+      i1,
+      M,
+    );
+    const { u: uTable, v: vArr, uMaxM, meridianM } = computeArcLengthUVTable(
+      outer,
+      MCombined,
+      N,
+    );
     const positions: number[] = [];
     const uvs: number[] = [];
+    const laserMm: number[] = [];
+    const laserPlaneMm: number[] = [];
     pushInnerSurfaceQuads(
       positions,
       uvs,
+      laserMm,
+      laserPlaneMm,
       inner,
-      M,
+      MCombined,
       N,
       collapseTop,
       uTable,
       vArr,
+      uMaxM,
+      meridianM,
     );
+    applyIsotropicUvToInnerFrontRise(uvs, uMaxM, meridianM);
     const geo = new THREE.BufferGeometry();
     geo.setAttribute(
       "position",
       new THREE.Float32BufferAttribute(positions, 3),
     );
     geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+    if (laserPlaneMm.length > 0) {
+      geo.setAttribute(
+        "laserPlaneMm",
+        new THREE.Float32BufferAttribute(laserPlaneMm, 2),
+      );
+    }
+    geo.computeVertexNormals();
+    geos.push(geo);
+    return geos;
+  }
+
+  for (const panel of frontRisePanelIndices(sk.spec.nSeams)) {
+    const { outer, inner } = computePanelOuterInnerGrids(sk, panel, M, N);
+    const { u: uTable, v: vArr, uMaxM, meridianM } = computeArcLengthUVTable(
+      outer,
+      M,
+      N,
+    );
+    const positions: number[] = [];
+    const uvs: number[] = [];
+    const laserMm: number[] = [];
+    const laserPlaneMm: number[] = [];
+    pushInnerSurfaceQuads(
+      positions,
+      uvs,
+      laserMm,
+      laserPlaneMm,
+      inner,
+      M,
+      N,
+      collapseTop,
+      uTable,
+      vArr,
+      uMaxM,
+      meridianM,
+    );
+    applyIsotropicUvToInnerFrontRise(uvs, uMaxM, meridianM);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(positions, 3),
+    );
+    geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+    if (laserPlaneMm.length > 0) {
+      geo.setAttribute(
+        "laserPlaneMm",
+        new THREE.Float32BufferAttribute(laserPlaneMm, 2),
+      );
+    }
     geo.computeVertexNormals();
     geos.push(geo);
   }
@@ -1684,15 +2259,317 @@ export function buildInnerFrontRiseGeometries(
 }
 
 /**
+ * Which part of the crown shell to emit. `full` = legacy single mesh (outer + inner + rim + top).
+ * `outer` / `inner` split the fabric into separate meshes for export (decals on outside only).
+ */
+export type CrownPanelGeometryShell = "full" | "outer" | "inner";
+
+/**
  * One BufferGeometry per crown panel (outer + inner shell, rim wall, top wall).
  * Front rise panels omit the inner shell from this mesh; use {@link buildInnerFrontRiseGeometries}.
+ *
+ * For {@link CrownPanelGeometryShell} `"outer"` / `"inner"`, rim and top bridging strips are
+ * omitted so each mesh uses only exterior or interior shell triangles (no shared bridging verts).
+ * Use {@link buildCrownPanelBridgeGeometries} alongside split shells to close the rim and apex edge.
  */
 export function buildCrownPanelGeometries(
   sk: BuiltSkeleton,
+  shell: CrownPanelGeometryShell = "full",
 ): THREE.BufferGeometry[] {
   const n = sk.spec.nSeams;
   const { M, N, collapseTop } = getCrownMeshResolution(sk);
   const frontRise = new Set(frontRisePanelIndices(sk.spec.nSeams));
+  const geos: THREE.BufferGeometry[] = [];
+
+  const isFull = shell === "full";
+  const wantOuter = shell === "outer" || isFull;
+  const wantInner = shell === "inner" || isFull;
+  /** Laser edge-distance attribute only for split outer/inner shells (not legacy `full` mesh). */
+  const useLaserAttr = !isFull;
+
+  const useClosure = sk.spec.backClosureOpening === true;
+  let closureCut: BackClosureCutSpec | undefined;
+  let leftPanel = -1;
+  let rightPanel = -1;
+  if (useClosure) {
+    closureCut = buildBackClosureCutSpec(sk);
+    const adj = getRearClosureAdjacentPanelIndices(n);
+    leftPanel = adj.leftPanel;
+    rightPanel = adj.rightPanel;
+  }
+
+  for (let panel = 0; panel < n; panel++) {
+    const positions: number[] = [];
+    const uvs: number[] = [];
+    const laserMm: number[] = [];
+    const laserPlaneMm: number[] = [];
+    const { outer, inner } = computePanelOuterInnerGrids(sk, panel, M, N);
+    const { u: uTable, v: vArr, uMaxM, meridianM } = computeArcLengthUVTable(
+      outer,
+      M,
+      N,
+    );
+    const cut =
+      useClosure && closureCut && (panel === leftPanel || panel === rightPanel)
+        ? closureCut
+        : undefined;
+    const isClosurePanel =
+      useClosure && !!closureCut && (panel === leftPanel || panel === rightPanel);
+
+    let closureShell:
+      | { outer: ClosureParamMesh; inner: ClosureParamMesh }
+      | undefined;
+    if (cut) {
+      closureShell = buildClosureShellIndexedMeshes(
+        sk,
+        panel,
+        inner,
+        M,
+        N,
+        collapseTop,
+        cut,
+      );
+      if (wantOuter) {
+        flushClosureParamMeshToPositions(
+          positions,
+          uvs,
+          useLaserAttr ? laserMm : null,
+          useLaserAttr ? laserPlaneMm : null,
+          closureShell.outer,
+          M,
+          N,
+          uTable,
+          vArr,
+          uMaxM,
+          meridianM,
+          cut,
+          isClosurePanel,
+        );
+      }
+      if (wantInner && !frontRise.has(panel)) {
+        flushClosureParamMeshToPositions(
+          positions,
+          uvs,
+          useLaserAttr ? laserMm : null,
+          useLaserAttr ? laserPlaneMm : null,
+          closureShell.inner,
+          M,
+          N,
+          uTable,
+          vArr,
+          uMaxM,
+          meridianM,
+          cut,
+          isClosurePanel,
+        );
+      }
+    } else if (wantOuter) {
+      for (let k = 0; k < N; k++) {
+        const lastStrip = k === N - 1;
+        for (let j = 0; j < M; j++) {
+          const v00 = outer[j]![k]!;
+          const v10 = outer[j + 1]![k]!;
+          const v01 = outer[j]![k + 1]!;
+          const v11 = outer[j + 1]![k + 1]!;
+          const u00: UVPair = [uTable[j]![k]!, vArr[k]!];
+          const u10: UVPair = [uTable[j + 1]![k]!, vArr[k]!];
+          const u01: UVPair = [uTable[j]![k + 1]!, vArr[k + 1]!];
+          const u11: UVPair = [uTable[j + 1]![k + 1]!, vArr[k + 1]!];
+          const l00 = laserEdgeDistMmAtJK(uTable, vArr, j, k, M, uMaxM, meridianM);
+          const l10 = laserEdgeDistMmAtJK(
+            uTable,
+            vArr,
+            j + 1,
+            k,
+            M,
+            uMaxM,
+            meridianM,
+          );
+          const l01 = laserEdgeDistMmAtJK(
+            uTable,
+            vArr,
+            j,
+            k + 1,
+            M,
+            uMaxM,
+            meridianM,
+          );
+          const l11 = laserEdgeDistMmAtJK(
+            uTable,
+            vArr,
+            j + 1,
+            k + 1,
+            M,
+            uMaxM,
+            meridianM,
+          );
+          const e00 = laserEdgeWithClosureW(l00, v00, cut, isClosurePanel);
+          const e10 = laserEdgeWithClosureW(l10, v10, cut, isClosurePanel);
+          const e01 = laserEdgeWithClosureW(l01, v01, cut, isClosurePanel);
+          const e11 = laserEdgeWithClosureW(l11, v11, cut, isClosurePanel);
+          const p00 = laserPlaneMmFromLrRim(l00, meridianM);
+          const p10 = laserPlaneMmFromLrRim(l10, meridianM);
+          const p01 = laserPlaneMmFromLrRim(l01, meridianM);
+          const p11 = laserPlaneMmFromLrRim(l11, meridianM);
+          const lm = useLaserAttr ? laserMm : null;
+          const lp = useLaserAttr ? laserPlaneMm : null;
+          if (!lastStrip || !collapseTop) {
+            pushTriangleWithUV(
+              positions,
+              uvs,
+              lm,
+              lp,
+              v00,
+              v10,
+              v01,
+              u00,
+              u10,
+              u01,
+              e00,
+              e10,
+              e01,
+              p00,
+              p10,
+              p01,
+            );
+            pushTriangleWithUV(
+              positions,
+              uvs,
+              lm,
+              lp,
+              v10,
+              v11,
+              v01,
+              u10,
+              u11,
+              u01,
+              e10,
+              e11,
+              e01,
+              p10,
+              p11,
+              p01,
+            );
+          } else {
+            pushTriangleWithUV(
+              positions,
+              uvs,
+              lm,
+              lp,
+              v00,
+              v10,
+              v01,
+              u00,
+              u10,
+              u01,
+              e00,
+              e10,
+              e01,
+              p00,
+              p10,
+              p01,
+            );
+          }
+        }
+      }
+    }
+
+    if (wantInner && !frontRise.has(panel) && !cut) {
+      pushInnerSurfaceQuads(
+        positions,
+        uvs,
+        useLaserAttr ? laserMm : null,
+        useLaserAttr ? laserPlaneMm : null,
+        inner,
+        M,
+        N,
+        collapseTop,
+        uTable,
+        vArr,
+        uMaxM,
+        meridianM,
+      );
+    }
+
+    if (isFull) {
+      pushCrownPanelRimAndTopWalls(
+        positions,
+        uvs,
+        outer,
+        inner,
+        M,
+        N,
+        collapseTop,
+        uTable,
+        vArr,
+        cut,
+      );
+    }
+
+    if (wantOuter && cut && panel === leftPanel) {
+      appendClosureTunnelWallParametric(
+        positions,
+        uvs,
+        useLaserAttr ? laserMm : null,
+        useLaserAttr ? laserPlaneMm : null,
+        sk,
+        cut,
+        M,
+        N,
+      );
+    }
+
+    if (isFull && positions.length > 0) {
+      const nv = positions.length / 3;
+      for (let i = 0; i < nv; i++) {
+        laserMm.push(
+          LASER_MASK_INNER_SHELL_MM,
+          LASER_MASK_INNER_SHELL_MM,
+          LASER_MASK_INNER_SHELL_MM,
+          LASER_MASK_INNER_SHELL_MM,
+        );
+        laserPlaneMm.push(0, 0);
+      }
+    }
+
+    const geo = new THREE.BufferGeometry();
+    if (positions.length === 0) {
+      geo.setAttribute("position", new THREE.Float32BufferAttribute([], 3));
+    } else {
+      geo.setAttribute(
+        "position",
+        new THREE.Float32BufferAttribute(positions, 3),
+      );
+      geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+      if (laserMm.length > 0) {
+        geo.setAttribute(
+          "laserEdgeDistMm",
+          new THREE.Float32BufferAttribute(laserMm, 4),
+        );
+      }
+      if (laserPlaneMm.length > 0) {
+        geo.setAttribute(
+          "laserPlaneMm",
+          new THREE.Float32BufferAttribute(laserPlaneMm, 2),
+        );
+      }
+      geo.computeVertexNormals();
+    }
+    geos.push(geo);
+  }
+
+  return geos;
+}
+
+/**
+ * Rim strip (bottom) and top strip that connect outer and inner crown shells. Intended for use with
+ * {@link buildCrownPanelGeometries} `"outer"` / `"inner"`, which omit these faces for decal export.
+ */
+export function buildCrownPanelBridgeGeometries(
+  sk: BuiltSkeleton,
+): THREE.BufferGeometry[] {
+  const n = sk.spec.nSeams;
+  const { M, N, collapseTop } = getCrownMeshResolution(sk);
   const geos: THREE.BufferGeometry[] = [];
 
   const useClosure = sk.spec.backClosureOpening === true;
@@ -1716,180 +2593,30 @@ export function buildCrownPanelGeometries(
         ? closureCut
         : undefined;
 
-    let closureShell:
-      | { outer: ClosureParamMesh; inner: ClosureParamMesh }
-      | undefined;
-    if (cut) {
-      closureShell = buildClosureShellIndexedMeshes(
-        sk,
-        panel,
-        inner,
-        M,
-        N,
-        collapseTop,
-        cut,
-      );
-      flushClosureParamMeshToPositions(
-        positions,
-        uvs,
-        closureShell.outer,
-        M,
-        N,
-        uTable,
-        vArr,
-      );
-      if (!frontRise.has(panel)) {
-        flushClosureParamMeshToPositions(
-          positions,
-          uvs,
-          closureShell.inner,
-          M,
-          N,
-          uTable,
-          vArr,
-        );
-      }
-    } else {
-      for (let k = 0; k < N; k++) {
-        const lastStrip = k === N - 1;
-        for (let j = 0; j < M; j++) {
-          const v00 = outer[j]![k]!;
-          const v10 = outer[j + 1]![k]!;
-          const v01 = outer[j]![k + 1]!;
-          const v11 = outer[j + 1]![k + 1]!;
-          const u00: UVPair = [uTable[j]![k]!, vArr[k]!];
-          const u10: UVPair = [uTable[j + 1]![k]!, vArr[k]!];
-          const u01: UVPair = [uTable[j]![k + 1]!, vArr[k + 1]!];
-          const u11: UVPair = [uTable[j + 1]![k + 1]!, vArr[k + 1]!];
-          if (!lastStrip || !collapseTop) {
-            pushTriangleWithUV(positions, uvs, v00, v10, v01, u00, u10, u01);
-            pushTriangleWithUV(positions, uvs, v10, v11, v01, u10, u11, u01);
-          } else {
-            pushTriangleWithUV(positions, uvs, v00, v10, v01, u00, u10, u01);
-          }
-        }
-      }
-    }
-
-    if (!frontRise.has(panel) && !cut) {
-      pushInnerSurfaceQuads(
-        positions,
-        uvs,
-        inner,
-        M,
-        N,
-        collapseTop,
-        uTable,
-        vArr,
-      );
-    }
-
-    if (cut) {
-      for (let j = 0; j < M; j++) {
-        appendRimOrTopQuadRecursive(
-          positions,
-          uvs,
-          outer[j]![0]!,
-          outer[j + 1]![0]!,
-          inner[j + 1]![0]!,
-          inner[j]![0]!,
-          [uTable[j]![0]!, 0],
-          [uTable[j + 1]![0]!, 0],
-          [uTable[j + 1]![0]!, 1],
-          [uTable[j]![0]!, 1],
-          0,
-          cut,
-        );
-      }
-    } else {
-      for (let j = 0; j < M; j++) {
-        const ua: UVPair = [uTable[j]![0]!, 0];
-        const ub: UVPair = [uTable[j]![0]!, 1];
-        const uc: UVPair = [uTable[j + 1]![0]!, 0];
-        const ud: UVPair = [uTable[j + 1]![0]!, 1];
-        pushTriangleWithUV(
-          positions,
-          uvs,
-          outer[j]![0]!,
-          inner[j]![0]!,
-          outer[j + 1]![0]!,
-          ua,
-          ub,
-          uc,
-        );
-        pushTriangleWithUV(
-          positions,
-          uvs,
-          outer[j + 1]![0]!,
-          inner[j]![0]!,
-          inner[j + 1]![0]!,
-          uc,
-          ub,
-          ud,
-        );
-      }
-    }
-
-    {
-      const kTop = collapseTop ? N - 1 : N;
-      if (cut) {
-        for (let j = 0; j < M; j++) {
-          appendTopWallQuadRecursive(
-            positions,
-            uvs,
-            outer[j]![kTop]!,
-            outer[j + 1]![kTop]!,
-            inner[j + 1]![kTop]!,
-            inner[j]![kTop]!,
-            [uTable[j]![kTop]!, 0],
-            [uTable[j + 1]![kTop]!, 0],
-            [uTable[j + 1]![kTop]!, 1],
-            [uTable[j]![kTop]!, 1],
-            0,
-            cut,
-          );
-        }
-      } else {
-        for (let j = 0; j < M; j++) {
-          const ua: UVPair = [uTable[j]![kTop]!, 0];
-          const ub: UVPair = [uTable[j + 1]![kTop]!, 0];
-          const uc: UVPair = [uTable[j + 1]![kTop]!, 1];
-          const ud: UVPair = [uTable[j]![kTop]!, 1];
-          pushTriangleWithUV(
-            positions,
-            uvs,
-            outer[j]![kTop]!,
-            outer[j + 1]![kTop]!,
-            inner[j + 1]![kTop]!,
-            ua,
-            ub,
-            uc,
-          );
-          pushTriangleWithUV(
-            positions,
-            uvs,
-            outer[j]![kTop]!,
-            inner[j + 1]![kTop]!,
-            inner[j]![kTop]!,
-            ua,
-            uc,
-            ud,
-          );
-        }
-      }
-    }
-
-    if (cut && panel === leftPanel) {
-      appendClosureTunnelWallParametric(positions, uvs, sk, cut, M, N);
-    }
+    pushCrownPanelRimAndTopWalls(
+      positions,
+      uvs,
+      outer,
+      inner,
+      M,
+      N,
+      collapseTop,
+      uTable,
+      vArr,
+      cut,
+    );
 
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute(
-      "position",
-      new THREE.Float32BufferAttribute(positions, 3),
-    );
-    geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
-    geo.computeVertexNormals();
+    if (positions.length === 0) {
+      geo.setAttribute("position", new THREE.Float32BufferAttribute([], 3));
+    } else {
+      geo.setAttribute(
+        "position",
+        new THREE.Float32BufferAttribute(positions, 3),
+      );
+      geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+      geo.computeVertexNormals();
+    }
     geos.push(geo);
   }
 

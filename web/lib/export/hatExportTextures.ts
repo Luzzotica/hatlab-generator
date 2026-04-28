@@ -147,6 +147,7 @@ export function applyTexturesToStandardMaterial(
 
 /**
  * GLB export uses flat white base materials with no maps so hosts can assign color/texture in code.
+ * Crown logo decals are appended **after** this step (see `appendHatDecalToSimpleExport`) so they keep `map`.
  */
 export function neutralizeExportMaterialTree(root: THREE.Object3D): void {
   root.traverse((o) => {
